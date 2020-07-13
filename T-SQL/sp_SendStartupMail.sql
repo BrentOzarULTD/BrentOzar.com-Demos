@@ -1,13 +1,85 @@
-/* If you want to drive the configuration from a table, insert a row into this: */
+/* sp_SendStartupMail - get alerted when your SQL Server starts up.
+
+Documentation: https://www.brentozar.com/go/startupmail
+
+To set this up, you need to:
+
+1. Enable startup stored procs
+
+2. Configure database mail: at least one profile and one operator
+
+3. If you have multiple profiles and/or operators, configure the table that
+  sp_SendStartupMail uses to pick which profile & operator to use
+
+4. Create sp_SendStartupMail and mark it as a startup stored procedure 
+
+And the below script will help. Let's get started.
+*/
+USE master;
+GO
+
+
+/* 1. Enable startup stored procs if they're not already enabled: */
+IF 0 = (SELECT value_in_use FROM sys.configurations WHERE name = 'scan for startup procs')
+	AND 0 = (SELECT value FROM sys.configurations WHERE name = 'scan for startup procs')
+	BEGIN
+
+	PRINT '/* WARNING! Startup stored procs not enabled. Run this to enable: */';
+	IF 0 = (SELECT value_in_use FROM sys.configurations WHERE name = 'show advanced options')
+		BEGIN
+		PRINT 'EXEC sp_configure ''show advanced options'', 1;';
+		PRINT 'RECONFIGURE;';
+		END
+
+	PRINT 'EXEC sp_configure ''scan for startup procs'', 1;';
+	PRINT 'RECONFIGURE;';
+	PRINT '/* And then restart the SQL Server service. (Or it will take effect automatically on the next restart.) */';
+	END
+GO
+
+
+/* 2. Configure database mail: at least one profile and one operator */
+IF NOT EXISTS (SELECT * FROM msdb.dbo.sysmail_profile)
+	BEGIN
+	PRINT 'Database mail is not configured. Configure it: https://www.brentozar.com/blitz/database-mail-configuration/';
+	PRINT 'Then create and enable an operator: https://www.brentozar.com/blitz/configure-sql-server-operators/';
+	END
+ELSE IF NOT EXISTS (SELECT COUNT(*) FROM msdb.dbo.sysoperators WHERE enabled = 1)
+	BEGIN
+	PRINT 'No operators are enabled. Create and enable one: https://www.brentozar.com/blitz/configure-sql-server-operators/'
+	END
+ELSE
+	PRINT 'No work to do here. Keep going.';
+GO
+
+
+
+/* Create a table to hold the mail config: */
 IF NOT EXISTS(SELECT * FROM sys.all_objects WHERE name = 'sp_SendStartupEmail_Config')
 	BEGIN
 	CREATE TABLE dbo.sp_SendStartupEmail_Config
 		(DatabaseMailProfileName SYSNAME, Recipients VARCHAR(MAX));
 	END
+
+
+/* 3. If you have multiple profiles and/or operators, configure the table that
+  sp_SendStartupMail uses to pick which profile & operator to use. */
+SELECT 'Profiles' AS table_name, name
+	FROM msdb.dbo.sysmail_profile;
+SELECT 'Recipients' AS table_name, email_address
+	FROM msdb.dbo.sysoperators;
+GO
+
+
+/* Armed with the above list of profiles & recipients, pick the one you want to use: */
+INSERT INTO dbo.sp_SendStartupEmail_Config (DatabaseMailProfileName, Recipients)
+	VALUES ('MyProfileNameGoesHere', 'EmailAddressGoesHere');
 GO
 
 
 
+
+/* 4. Create sp_SendStartupMail and mark it as a startup stored procedure  */
 IF OBJECT_ID('dbo.sp_SendStartupEmail') IS NULL
   EXEC ('CREATE PROCEDURE dbo.sp_SendStartupEmail AS RETURN 0;');
 GO
@@ -70,25 +142,41 @@ EXEC msdb.dbo.sp_send_dbmail
 END
 GO
 
-
-
 /* Mark this stored procedure as a startup stored procedure: */
 EXEC sp_procoption @ProcName = N'sp_SendStartupEmail',
 	@OptionName = 'startup',
 	@OptionValue = 'on';
 GO
 
-IF 0 = (SELECT value_in_use FROM sys.configurations WHERE name = 'scan for startup procs')
-	AND 0 = (SELECT value FROM sys.configurations WHERE name = 'scan for startup procs')
-	BEGIN
-
-	PRINT '/* WARNING! Startup stored procs not enabled. Run this to enable: */';
-	PRINT 'EXEC sp_configure ''scan for startup procs'', 1;'
-	PRINT 'RECONFIGURE;'
-	PRINT '/* And then restart the SQL Server service. (Or it will take effect automatically on the next restart.) */'
-	END
 
 
-/* For testing: 
+
+/* To test it, just run it and verify that it runs without error, and you get an email: */
 EXEC sp_SendStartupEmail;
+GO
+
+
+
+/*
+MIT License
+
+Copyright (c) 2020 Brent Ozar Unlimited
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 */
