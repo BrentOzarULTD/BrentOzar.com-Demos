@@ -88,6 +88,7 @@ BEGIN
         @Now              datetime2(0),
         @InputAction      varchar(20),
         @OriginalAction   varchar(20),
+        @ReadOnlySnapshot bit = 0,
         @ActionConsumed   bit = 0,
         @KeepWaiting      bit = 0,
         @LockResult       int,
@@ -99,6 +100,8 @@ BEGIN
 
     SET @OriginalAction = UPPER(LTRIM(RTRIM(COALESCE(@Action, ''))));
     SET @InputAction = NULLIF(@OriginalAction, '');
+    IF @OriginalAction IN ('STATUS', 'REFRESH')
+        SET @ReadOnlySnapshot = 1;
     IF @InputAction IN ('JOIN', 'WATCH', 'STATUS', 'REFRESH')
         SET @InputAction = NULL;
 
@@ -306,10 +309,12 @@ BEGIN
             WHERE DatabaseId = @DatabaseId
               AND SessionId = @SessionId
         )
+           AND @ReadOnlySnapshot = 0
         BEGIN
             DECLARE @OpenSeat tinyint = NULL;
 
             IF @Phase = 'LOBBY'
+               AND @OriginalAction <> 'WATCH'
                AND (SELECT COUNT(*)
                     FROM ##TexasHoldEm_Players_Codex_v1
                     WHERE DatabaseId = @DatabaseId
@@ -340,27 +345,31 @@ BEGIN
                 @DatabaseId, @SessionId,
                 COALESCE(NULLIF(@PlayerName, N''), N'Session ' + CONVERT(nvarchar(12), @SessionId)),
                 @OpenSeat, 0, CASE WHEN @OpenSeat IS NULL THEN 'SPECTATOR' ELSE 'PLAYER' END,
-                1000, CASE WHEN @OpenSeat IS NULL THEN 1 ELSE 0 END,
+                1000, CASE WHEN @OpenSeat IS NOT NULL OR @OriginalAction = 'WATCH' THEN 0 ELSE 1 END,
                 0, 0, 0, NULL, 0, 0, 0, 0, NULL, NULL, @Now, @Now
             );
 
             INSERT ##TexasHoldEm_Log_Codex_v1 (DatabaseId, HandNumber, LoggedAt, Message)
             SELECT @DatabaseId, HandNumber, @Now,
                 COALESCE(NULLIF(@PlayerName, N''), N'Session ' + CONVERT(nvarchar(12), @SessionId))
-                + CASE WHEN @OpenSeat IS NULL
-                       THEN N' is watching and has requested the next available seat.'
-                       ELSE N' joined in seat ' + CONVERT(nvarchar(3), @OpenSeat) + N'.'
+                + CASE WHEN @OpenSeat IS NOT NULL
+                       THEN N' joined in seat ' + CONVERT(nvarchar(3), @OpenSeat) + N'.'
+                       WHEN @OriginalAction = 'WATCH'
+                       THEN N' is watching from the rail.'
+                       ELSE N' is watching and has requested the next available seat.'
                   END
             FROM ##TexasHoldEm_Game_Codex_v1
             WHERE DatabaseId = @DatabaseId;
         END
-        ELSE
+        ELSE IF @ReadOnlySnapshot = 0
         BEGIN
             UPDATE ##TexasHoldEm_Players_Codex_v1
             SET PlayerName = COALESCE(NULLIF(@PlayerName, N''), PlayerName),
                 LastSeenAt = @Now,
                 WantsSeat = CASE
-                    WHEN PlayerRole = 'SPECTATOR' AND QueryBucks > 0 THEN 1
+                    WHEN PlayerRole = 'SPECTATOR' AND @OriginalAction = 'WATCH' THEN 0
+                    WHEN PlayerRole = 'SPECTATOR' AND QueryBucks > 0
+                         AND @OriginalAction NOT IN ('STATUS', 'REFRESH', 'WATCH') THEN 1
                     ELSE WantsSeat
                 END
             WHERE DatabaseId = @DatabaseId
@@ -1438,6 +1447,7 @@ BEGIN
         @ViewerRole varchar(12),
         @ViewerSeat tinyint,
         @ViewerBucks int,
+        @ViewerWantsSeat bit,
         @GamePhase varchar(12),
         @GameHand int,
         @GamePot int,
@@ -1462,11 +1472,15 @@ BEGIN
         @ViewerRole = PlayerRole,
         @ViewerSeat = Seat,
         @ViewerBucks = QueryBucks,
+        @ViewerWantsSeat = WantsSeat,
         @ViewerStreetBet = StreetBet,
         @ViewerStack = QueryBucks
     FROM ##TexasHoldEm_Players_Codex_v1
     WHERE DatabaseId = @DatabaseId
       AND SessionId = @SessionId;
+
+    IF @ViewerRole IS NULL AND @ReadOnlySnapshot = 1
+        SET @ViewerRole = 'SPECTATOR';
 
     SELECT
         @GamePhase = Phase,
@@ -1514,7 +1528,7 @@ BEGIN
     ELSE IF @GamePhase = 'BETWEEN'
     BEGIN
         SET @Prompt = N'The hand is over. Waiting players may take open seats before the next hand.';
-        SET @LegalActions = CASE WHEN @ViewerRole = 'SPECTATOR' AND @ViewerBucks > 0
+        SET @LegalActions = CASE WHEN @ViewerRole = 'SPECTATOR' AND @ViewerWantsSeat = 1
                                  THEN N'You have requested the next available seat.'
                                  ELSE N'Run the procedure again to continue.' END;
         SET @Example = N'EXEC dbo.sp_TexasHoldEm;';
