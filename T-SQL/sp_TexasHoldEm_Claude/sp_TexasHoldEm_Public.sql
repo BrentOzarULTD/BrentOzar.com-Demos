@@ -147,7 +147,13 @@ CREATE TABLE dbo.TexasHoldEm_Game (
 IF OBJECT_ID(N'dbo.TexasHoldEm_Players', N'U') IS NULL
 CREATE TABLE dbo.TexasHoldEm_Players (
     SeatNum tinyint PRIMARY KEY,
-    PlayerName nvarchar(30) NOT NULL,
+    /* Explicit CI collation + UNIQUE: a name is a player's identity, so it
+       must not depend on the host database's collation. On a case-sensitive
+       database, "Alice" and "alice" would otherwise be two different seats,
+       and the reconnect/impersonation checks would quietly change behavior.
+       The UNIQUE constraint keeps the invariant with the data, not just in
+       procedural checks. */
+    PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS NOT NULL UNIQUE,
     SessionId int NOT NULL,
     /* session_id gets recycled when sessions disconnect, so a seat is only
        "yours" if BOTH the session id and its login_time match. */
