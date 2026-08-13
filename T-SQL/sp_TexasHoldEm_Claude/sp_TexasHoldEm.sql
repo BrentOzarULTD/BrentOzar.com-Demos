@@ -39,7 +39,10 @@ House rules:
 
 Requirements & caveats:
   - SQL Server 2017+ or Azure SQL DB (uses STRING_AGG and global ## tables).
-  - All players must be in the same database on the same server.
+  - All players must be in the same database on the same server. On boxed
+    SQL Server there's one game per instance: the ## tables are instance-
+    global but applocks are database-scoped, so the game claims a home
+    database and politely refuses sessions connected anywhere else.
   - The game state lives in global temp tables (##TexasHoldEm_*), created by
     whoever runs the proc first. If THAT session disconnects, SQL Server
     drops the tables and the casino burns down mid-hand. Everyone else gets
@@ -75,6 +78,7 @@ DECLARE @SmallBlind int = 10,
         @MaxWaitMinutes int = 60;    /* give up blocking after this long */
 
 DECLARE @rc int,
+        @OwnerDb nvarchar(128),
         @Msg nvarchar(2047),
         @Notice nvarchar(500),
         @MySeat tinyint,
@@ -216,8 +220,10 @@ BEGIN
                 RETURN;
             END
 
+            /* COLLATE DATABASE_DEFAULT keeps string comparisons working when
+               the user database's collation differs from tempdb's. */
             CREATE TABLE ##TexasHoldEm_Game (
-                GameState varchar(20) NOT NULL,
+                GameState varchar(20) COLLATE DATABASE_DEFAULT NOT NULL,
                 HandNumber int NOT NULL,
                 DealerSeat tinyint NULL,
                 SmallBlindSeat tinyint NULL,
@@ -233,11 +239,15 @@ BEGIN
                 TurnSeat tinyint NULL,
                 TurnStartedAt datetime2 NULL,
                 JoinWindowEndsAt datetime2 NULL,
-                NextHandStartsAt datetime2 NULL);
+                NextHandStartsAt datetime2 NULL,
+                /* On SQL Server, ## tables are instance-global but applocks are
+                   database-scoped, so the game claims a home database and turns
+                   away sessions from anywhere else - one table per instance. */
+                CreatedInDatabase nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL);
 
             CREATE TABLE ##TexasHoldEm_Players (
                 SeatNum tinyint PRIMARY KEY,
-                PlayerName nvarchar(30) NOT NULL,
+                PlayerName nvarchar(30) COLLATE DATABASE_DEFAULT NOT NULL,
                 SessionId int NOT NULL,
                 IsBot bit NOT NULL,
                 Chips int NOT NULL,
@@ -255,10 +265,10 @@ BEGIN
                 LogId int IDENTITY(1,1) PRIMARY KEY,
                 HandNumber int NOT NULL,
                 EventTime datetime2 NOT NULL DEFAULT SYSDATETIME(),
-                Message nvarchar(500) NOT NULL);
+                Message nvarchar(500) COLLATE DATABASE_DEFAULT NOT NULL);
 
-            INSERT ##TexasHoldEm_Game (GameState, HandNumber, JoinWindowEndsAt)
-            VALUES ('WaitingForPlayers', 0, DATEADD(second, @JoinWindowSeconds, SYSDATETIME()));
+            INSERT ##TexasHoldEm_Game (GameState, HandNumber, JoinWindowEndsAt, CreatedInDatabase)
+            VALUES ('WaitingForPlayers', 0, DATEADD(second, @JoinWindowSeconds, SYSDATETIME()), DB_NAME());
 
             INSERT ##TexasHoldEm_Log (HandNumber, Message)
             VALUES (0, CONCAT(N'A new Texas Hold ''Em game is starting! Waiting up to ', @JoinWindowSeconds,
@@ -266,6 +276,18 @@ BEGIN
         END
         ELSE
         BEGIN
+            /* Somebody else's game: make sure it lives in THIS database, because
+               our applock can't protect a game that belongs to another one. */
+            SET @OwnerDb = NULL;
+            SELECT @OwnerDb = CreatedInDatabase FROM ##TexasHoldEm_Game;
+            IF @OwnerDb IS NULL OR @OwnerDb <> DB_NAME()
+            BEGIN
+                COMMIT;
+                SELECT [Wrong Database] = CONCAT(N'There''s already a game running from the [', @OwnerDb,
+                    N'] database on this instance, and one table is all this casino''s got. Connect to that database to play.');
+                RETURN;
+            END
+
             SET @LastLogId = ISNULL((SELECT MAX(LogId) FROM ##TexasHoldEm_Log), 0) - 12;
             IF @LastLogId < 0 SET @LastLogId = 0;
 
@@ -291,7 +313,10 @@ BEGIN
            reclaim your seat after reconnecting - your name is your key). */
         SET @MySeat = NULL;
         SELECT @MySeat = SeatNum FROM ##TexasHoldEm_Players WHERE SessionId = @@SPID AND IsBot = 0;
+        /* Only actions that actually take control of the seat may reclaim it -
+           a Status or Watch peek must never hijack a live player's session. */
         IF @MySeat IS NULL AND @PlayerName IS NOT NULL
+           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave'))
         BEGIN
             SET @CurOwner = NULL;
             SELECT @MySeat = SeatNum, @CurOwner = SessionId
@@ -477,6 +502,20 @@ BEGIN
         SET @TargetHand = CASE WHEN @GState = 'InHand' THEN @GHand ELSE @GHand + 1 END;
     END /* first pass */
 
+    IF @FirstPass = 0
+    BEGIN
+        /* If the game evaporated and a session in a DIFFERENT database started
+           a new one between our polls, our applock doesn't cover it - back out. */
+        SET @OwnerDb = NULL;
+        SELECT @OwnerDb = CreatedInDatabase FROM ##TexasHoldEm_Game;
+        IF @OwnerDb IS NULL OR @OwnerDb <> DB_NAME()
+        BEGIN
+            COMMIT;
+            SET @GameGone = 1;
+            BREAK;
+        END
+    END
+
     /* ================================================================
        THE ENGINE. Any session holding the lock advances everything that
        is ready to advance: the join clock, robot decisions, human shot
@@ -547,7 +586,7 @@ BEGIN
             SELECT @NumInHand = COUNT(*) FROM ##TexasHoldEm_Players WHERE InHand = 1;
             IF @NumInHand < 2
             BEGIN
-                UPDATE ##TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
+                UPDATE ##TexasHoldEm_Game SET GameState = 'GameOver', HandNumber = @GHand, TurnSeat = NULL;
                 INSERT ##TexasHoldEm_Log (HandNumber, Message) VALUES (@GHand, N'Not enough players to deal. GAME OVER.');
                 CONTINUE;
             END
@@ -1256,6 +1295,7 @@ BEGIN
     SET @Unit = CASE WHEN @Round <= 1 THEN @SmallBet ELSE @BigBet END;
     SET @NewBet = CASE WHEN @BetToCall = 0 THEN @Unit ELSE @BetToCall + @Unit END;
     SET @SecondsLeft = @TurnSeconds - DATEDIFF(second, @TurnStartedAt, SYSDATETIME());
+    IF @SecondsLeft < 0 SET @SecondsLeft = 0;
 
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'>>> YOUR TURN, ', @PlayerName, N'! You have ', @MyCards, N'. Pot: ', @PotDisp, N'. ',

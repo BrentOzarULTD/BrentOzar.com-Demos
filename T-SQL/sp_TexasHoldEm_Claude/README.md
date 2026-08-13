@@ -64,7 +64,11 @@ Management Studio. Each query window is a player. Yes, really.
 ## Requirements & caveats
 
 - SQL Server 2017+ or Azure SQL DB (uses `STRING_AGG` and `##` temp tables).
-- All players connect to the same database on the same server.
+- All players connect to the same database on the same server. On boxed SQL
+  Server there's **one game per instance**: the `##` tables are
+  instance-global but applocks are database-scoped, so the game records its
+  home database and refuses sessions connected anywhere else rather than
+  risk two databases mutating one game under different locks.
 - No permanent objects outside the proc itself: game state lives in
   `##TexasHoldEm_Game`, `##TexasHoldEm_Players`, and `##TexasHoldEm_Log`,
   created by whoever runs the proc first. **If that first session
