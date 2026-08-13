@@ -60,7 +60,7 @@ The procedure returns three result sets:
 IF CERT_ID(N'sp_TexasHoldEm_CardProtection_Public') IS NULL
 BEGIN
     CREATE CERTIFICATE sp_TexasHoldEm_CardProtection_Public
-        ENCRYPTION BY PASSWORD = 'QueryBucks-Public-demo-certificate-2026!'
+        ENCRYPTION BY PASSWORD = 'THeP!9xQ#4mZ@7vK$2sN_2026'
         WITH SUBJECT = 'Encrypt transient sp_TexasHoldEm_Public hole cards',
              EXPIRY_DATE = '20991231';
 END;
@@ -228,6 +228,8 @@ BEGIN
         @PrincipalId      int = USER_ID(),
         @SafePlayerName   nvarchar(50),
         @ResolvedPlayerName nvarchar(50),
+        @NamePosition     int,
+        @NameCodePoint    int,
         @Now              datetime2(0),
         @InputAction      varchar(20),
         @OriginalAction   varchar(20),
@@ -281,11 +283,29 @@ BEGIN
        (
            LEN(@SafePlayerName) < 2
            OR LEN(@SafePlayerName) > 30
-           OR @SafePlayerName COLLATE Latin1_General_100_BIN2 LIKE N'%[^A-Za-z0-9 ._''-]%'
            OR UPPER(@SafePlayerName) LIKE N'QUERYBOT%'
        )
     BEGIN
         THROW 50005, 'Player names must be 2-30 characters using letters, numbers, spaces, apostrophes, periods, underscores, or hyphens.', 1;
+    END;
+
+    /* Avoid LIKE bracket-expression range surprises: validate the exact ASCII
+       code points promised in the public contract. */
+    SET @NamePosition = 1;
+    WHILE @SafePlayerName IS NOT NULL
+      AND @NamePosition <= LEN(@SafePlayerName)
+    BEGIN
+        SET @NameCodePoint = UNICODE(SUBSTRING(@SafePlayerName, @NamePosition, 1));
+
+        IF @NameCodePoint NOT BETWEEN 48 AND 57
+           AND @NameCodePoint NOT BETWEEN 65 AND 90
+           AND @NameCodePoint NOT BETWEEN 97 AND 122
+           AND @NameCodePoint NOT IN (32, 39, 45, 46, 95)
+        BEGIN
+            THROW 50005, 'Player names must be 2-30 characters using letters, numbers, spaces, apostrophes, periods, underscores, or hyphens.', 1;
+        END;
+
+        SET @NamePosition += 1;
     END;
 
     SET @ResolvedPlayerName = COALESCE
@@ -1088,7 +1108,7 @@ BEGIN
                     (
                         CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
                         p.HoleCardsEncrypted,
-                        N'QueryBucks-Public-demo-certificate-2026!'
+                        N'THeP!9xQ#4mZ@7vK$2sN_2026'
                     ))
                 )
             ) AS h(HoleCards)
@@ -1389,7 +1409,7 @@ BEGIN
                             (
                                 CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
                                 p.HoleCardsEncrypted,
-                                N'QueryBucks-Public-demo-certificate-2026!'
+                                N'THeP!9xQ#4mZ@7vK$2sN_2026'
                             ))
                         )
                     ) AS h(HoleCards)
@@ -1926,7 +1946,7 @@ BEGIN
             (
                 CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
                 p.HoleCardsEncrypted,
-                N'QueryBucks-Public-demo-certificate-2026!'
+                N'THeP!9xQ#4mZ@7vK$2sN_2026'
             )) AS HoleCards
         WHERE p.HoleCardsEncrypted IS NOT NULL
           AND
@@ -1963,7 +1983,7 @@ GO
 
 ADD SIGNATURE TO OBJECT::dbo.sp_TexasHoldEm_Public
     BY CERTIFICATE sp_TexasHoldEm_CardProtection_Public
-    WITH PASSWORD = 'QueryBucks-Public-demo-certificate-2026!';
+    WITH PASSWORD = 'THeP!9xQ#4mZ@7vK$2sN_2026';
 GO
 
 GRANT EXECUTE ON OBJECT::dbo.sp_TexasHoldEm_Public TO TexasHoldEm_Public_Players;
