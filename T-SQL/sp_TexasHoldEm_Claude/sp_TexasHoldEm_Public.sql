@@ -341,13 +341,24 @@ BEGIN
     RETURN;
 END
 
-IF OBJECT_ID(N'dbo.TexasHoldEm_Game', N'U') IS NULL
-   OR OBJECT_ID(N'dbo.TexasHoldEm_Players', N'U') IS NULL
-   OR OBJECT_ID(N'dbo.TexasHoldEm_Log', N'U') IS NULL
-BEGIN
-    SELECT [Not Deployed] = N'The casino hasn''t been built: the dbo.TexasHoldEm_* tables are missing. An admin needs to run the full setup script from the top of this proc''s source file.';
-    RETURN;
-END
+/* Is the casino built? OBJECT_ID would lie here: a player with only
+   EXECUTE on this proc has no metadata visibility on the tables, so
+   OBJECT_ID returns NULL for them even when everything is deployed
+   correctly. Probe with dynamic SQL instead - it runs as the caller, with
+   no ownership chaining, so a locked-down player gets error 229
+   (permission denied - the healthy state, carry on), while a missing
+   table raises error 208 from a lower execution level, which - unlike a
+   same-scope compile error - this proc CAN catch and translate. */
+BEGIN TRY
+    EXEC sp_executesql N'SELECT TOP (0) 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log;';
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() = 208
+    BEGIN
+        SELECT [Not Deployed] = N'The casino hasn''t been built: the dbo.TexasHoldEm_* tables are missing. An admin needs to run the full setup script from the top of this proc''s source file.';
+        RETURN;
+    END
+END CATCH
 
 /* The applock's name is random and stored where players can't read it, so
    nobody can grab the lock outside this proc and jam the game. */
@@ -470,7 +481,10 @@ BEGIN
                 END
             END
         END
-        IF @MySeat IS NOT NULL AND @PlayerName IS NULL
+        /* Once the seat is resolved, the seat's name is THE name - always.
+           Otherwise a seated player could pass somebody else's @PlayerName
+           and have the log narrate their bets under the victim's name. */
+        IF @MySeat IS NOT NULL
             SELECT @PlayerName = PlayerName FROM dbo.TexasHoldEm_Players WHERE SeatNum = @MySeat;
 
         IF @Action = N'Watch' AND @MySeat IS NULL SET @IsObserver = 1;
