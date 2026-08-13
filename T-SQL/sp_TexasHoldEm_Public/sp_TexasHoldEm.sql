@@ -163,7 +163,7 @@ BEGIN
     );
 
     CREATE UNIQUE INDEX UX_TexasHoldEm_Public_PlayerState_Connection
-        ON TexasHoldEm_Public.PlayerState(DatabaseId, ConnectionId, PlayerId)
+        ON TexasHoldEm_Public.PlayerState(DatabaseId, ConnectionId)
         WHERE ConnectionId IS NOT NULL;
 
     CREATE UNIQUE INDEX UX_TexasHoldEm_Public_PlayerState_Seat
@@ -222,6 +222,7 @@ BEGIN
     DECLARE
         @DatabaseId       int = DB_ID(),
         @SqlSessionId     int = @@SPID,
+        @SessionLoginTime datetime,
         @ConnectionId     uniqueidentifier,
         @PlayerId         uniqueidentifier,
         @PrincipalId      int = USER_ID(),
@@ -235,6 +236,7 @@ BEGIN
         @ActionConsumed   bit = 0,
         @Phase            varchar(12),
         @Notice           nvarchar(4000) = NULL,
+        @TransactionCommitted bit = 0,
         @HandJustEnded    bit = 0,
         @StartHand        bit = 0,
         @LoopGuard        int = 0;
@@ -245,16 +247,31 @@ BEGIN
     IF (@@OPTIONS & 2) = 2
         THROW 50009, 'Turn IMPLICIT_TRANSACTIONS OFF before running sp_TexasHoldEm_Public.', 1;
 
-    /* The current request's connection_id is server-owned and immutable.
-       CONTEXT_INFO and SESSION_CONTEXT are intentionally not trusted because
-       hostile callers can set either value before invoking the procedure. */
-    SELECT @ConnectionId = connection_id
-    FROM sys.dm_exec_requests
-    WHERE session_id = @SqlSessionId
-      AND request_id = CURRENT_REQUEST_ID();
+    /* Derive an immutable identity from server-owned session attributes.
+       Every login can see its own sys.dm_exec_sessions row, including on Azure
+       SQL Database; no VIEW DATABASE STATE permission is granted to players. */
+    SELECT @SessionLoginTime = login_time
+    FROM sys.dm_exec_sessions
+    WHERE session_id = @SqlSessionId;
 
-    IF @ConnectionId IS NULL
-        THROW 50004, 'SQL Server did not provide a connection identity.', 1;
+    IF @SessionLoginTime IS NULL
+        THROW 50004, 'SQL Server did not provide a session identity.', 1;
+
+    SET @ConnectionId = CONVERT
+    (
+        uniqueidentifier,
+        SUBSTRING
+        (
+            HASHBYTES
+            (
+                'SHA2_256',
+                CONVERT(varbinary(4), @SqlSessionId)
+                + CONVERT(varbinary(8), @SessionLoginTime)
+            ),
+            1,
+            16
+        )
+    );
 
     SET @PlayerId = @ConnectionId;
 
@@ -281,7 +298,7 @@ BEGIN
     SET @InputAction = NULLIF(@OriginalAction, '');
     IF @OriginalAction IN ('STATUS', 'REFRESH')
         SET @ReadOnlySnapshot = 1;
-    IF @OriginalAction IN ('', 'JOIN')
+    IF @OriginalAction IN ('', 'JOIN', 'NEWGAME', 'RESET')
         SET @SeatRequested = 1;
     IF @InputAction IN ('JOIN', 'WATCH', 'STATUS', 'REFRESH')
         SET @InputAction = NULL;
@@ -391,7 +408,7 @@ BEGIN
         DELETE FROM TexasHoldEm_Public.PlayerState
         WHERE DatabaseId = @DatabaseId
           AND IsRobot = 0
-          AND PlayerRole <> 'PLAYER'
+          AND PlayerRole = 'SPECTATOR'
           AND PlayerId <> @PlayerId
           AND LastSeenAt < DATEADD(minute, -10, @Now);
 
@@ -410,6 +427,9 @@ BEGIN
             SET @ActionConsumed = 1;
         END;
 
+        /* Keep storage bounded without turning the cap into a permanent
+           admission lock: a new join displaces the stalest spectator. OUT rows
+           are retained until NEWGAME so an idle busted connection stays out. */
         IF @ReadOnlySnapshot = 0
            AND NOT EXISTS
            (
@@ -425,10 +445,29 @@ BEGIN
                FROM TexasHoldEm_Public.PlayerState
                WHERE DatabaseId = @DatabaseId
                  AND IsRobot = 0
+                 AND PlayerRole <> 'OUT'
            ) >= 64
         BEGIN
-            SET @ReadOnlySnapshot = 1;
-            SET @Notice = N'The waiting room is full. You can watch with STATUS and try JOIN later.';
+            ;WITH StalestSpectator AS
+            (
+                SELECT TOP (1) PlayerId
+                FROM TexasHoldEm_Public.PlayerState
+                WHERE DatabaseId = @DatabaseId
+                  AND IsRobot = 0
+                  AND PlayerRole = 'SPECTATOR'
+                  AND PlayerId <> @PlayerId
+                ORDER BY LastSeenAt, JoinedAt, PlayerId
+            )
+            DELETE p
+            FROM TexasHoldEm_Public.PlayerState AS p
+            INNER JOIN StalestSpectator AS s ON s.PlayerId = p.PlayerId
+            WHERE p.DatabaseId = @DatabaseId;
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                SET @ReadOnlySnapshot = 1;
+                SET @Notice = N'The table cannot accept another player identity right now. You can watch with STATUS.';
+            END;
         END;
 
         /* Register this connection-scoped identity as a player or spectator. */
@@ -1596,8 +1635,7 @@ BEGIN
                     SET StreetBet = 0,
                         ActedThisStreet = 0
                     WHERE DatabaseId = @DatabaseId
-                      AND InHand = 1
-                      AND Folded = 0;
+                      AND InHand = 1;
 
                     SELECT TOP (1) @FirstPostFlop = p.Seat
                     FROM TexasHoldEm_Public.PlayerState AS p
@@ -1671,6 +1709,7 @@ BEGIN
         END;
 
         COMMIT TRANSACTION;
+        SET @TransactionCommitted = 1;
 
         BREAK;
     END;
@@ -1695,7 +1734,6 @@ BEGIN
         @LegalActions nvarchar(500),
         @Example nvarchar(1000),
         @ViewerStreetBet int,
-        @ViewerStack int,
         @ViewerToCall int,
         @OutputMaximum int,
         @DisplayedMinimumRaiseTo int,
@@ -1706,8 +1744,7 @@ BEGIN
         @ViewerSeat = Seat,
         @ViewerBucks = QueryBucks,
         @ViewerWantsSeat = WantsSeat,
-        @ViewerStreetBet = StreetBet,
-        @ViewerStack = QueryBucks
+        @ViewerStreetBet = StreetBet
     FROM TexasHoldEm_Public.PlayerState
     WHERE DatabaseId = @DatabaseId
       AND PlayerId = @PlayerId
@@ -1912,6 +1949,9 @@ BEGIN
     BEGIN CATCH
         IF XACT_STATE() <> 0
             ROLLBACK TRANSACTION;
+
+        IF ERROR_NUMBER() = 1222 AND @TransactionCommitted = 1
+            THROW 50010, 'Your action committed, but the refreshed table view timed out. Run STATUS; do not repeat the action.', 1;
 
         IF ERROR_NUMBER() = 1222
             THROW 50008, 'The poker table is busy. Please try again.', 1;

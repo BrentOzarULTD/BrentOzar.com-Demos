@@ -73,8 +73,18 @@ alerts, credential rotation, and a tested kill switch. Assume published shared
 credentials will be automated against immediately.
 
 A shared login also cannot prove that four connections represent four people.
-One person can occupy multiple seats or collude with themselves. Use individual
-Microsoft Entra/database identities or put an authenticated application/API in
-front of SQL when one-human-one-seat enforcement matters.
+One person can occupy multiple seats, collude with themselves, or reconnect
+under a new connection identity to receive another starting bankroll. An OUT
+row is retained for the life of its game so an idle connection does not regain
+chips, but a shared credential provides no durable human identity across
+reconnections. Use individual Microsoft Entra/database identities or put an
+authenticated application/API in front of SQL when one-human-one-seat or
+one-bankroll-per-human enforcement matters.
+
+The waiting list retains at most 60 spectators in addition to the four seats.
+When it is full, a new join evicts the stalest spectator instead of permanently
+locking out newcomers. A hostile client can still churn that queue or exhaust
+connection and compute limits; the database isolation, monitoring, and kill
+switch above remain required.
 
 The game uses fake QueryBucks and is not designed for money or prizes.
