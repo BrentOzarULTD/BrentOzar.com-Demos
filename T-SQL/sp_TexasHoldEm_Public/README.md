@@ -18,8 +18,13 @@ The installer creates:
 The procedure does not use `EXECUTE AS OWNER`. Calls made inside caller-owned
 transactions are rejected, state changes use a protected row lock, `RESET` is
 restricted to database administrators, lobby calls do not wait on a server
-worker, abandoned spectator state and old logs are bounded, and player names
+worker, registered identities and old logs are bounded, and player names
 are immutable and restricted to display-safe characters.
+
+Connection identity uses a certificate-authenticated, read-only session token;
+it does not query session DMVs or require `VIEW DATABASE STATE`. Disable Multiple
+Active Result Sets (MARS) on player connections because SQL Server cannot mark
+the token read-only on a MARS connection.
 
 This boundary protects against users who have only `CONNECT` plus membership in
 `TexasHoldEm_Public_Players`. It does not protect against `db_owner`, server
@@ -75,16 +80,17 @@ credentials will be automated against immediately.
 A shared login also cannot prove that four connections represent four people.
 One person can occupy multiple seats, collude with themselves, or reconnect
 under a new connection identity to receive another starting bankroll. An OUT
-row is retained for the life of its game so an idle connection does not regain
-chips, but a shared credential provides no durable human identity across
-reconnections. Use individual Microsoft Entra/database identities or put an
-authenticated application/API in front of SQL when one-human-one-seat or
-one-bankroll-per-human enforcement matters.
+row is retained while capacity permits so an idle connection does not
+immediately regain chips, but a shared credential provides no durable human
+identity across reconnections. Use individual Microsoft Entra/database
+identities or put an authenticated application/API in front of SQL when
+one-human-one-seat or one-bankroll-per-human enforcement matters.
 
-The waiting list retains at most 60 spectators in addition to the four seats.
-When it is full, a new join evicts the stalest spectator instead of permanently
-locking out newcomers. A hostile client can still churn that queue or exhaust
-connection and compute limits; the database isolation, monitoring, and kill
-switch above remain required.
+The game retains at most 64 human identities, including players, spectators,
+and OUT rows. At capacity, a new join evicts the oldest OUT identity first and
+then the stalest spectator; active seats are never evicted. Result sets list
+only the current seats, not accumulated OUT rows. A hostile client can still
+churn that queue or exhaust connection and compute limits; the database
+isolation, monitoring, and kill switch above remain required.
 
 The game uses fake QueryBucks and is not designed for money or prizes.

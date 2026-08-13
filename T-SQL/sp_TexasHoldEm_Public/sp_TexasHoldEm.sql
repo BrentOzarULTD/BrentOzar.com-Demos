@@ -222,7 +222,12 @@ BEGIN
     DECLARE
         @DatabaseId       int = DB_ID(),
         @SqlSessionId     int = @@SPID,
-        @SessionLoginTime datetime,
+        @SessionTokenEncrypted varbinary(8000),
+        @SessionTokenPlain varbinary(8000),
+        @SessionBindingHash varbinary(32),
+        @TokenDatabaseId  int,
+        @TokenSessionId   int,
+        @TokenPrincipalId int,
         @ConnectionId     uniqueidentifier,
         @PlayerId         uniqueidentifier,
         @PrincipalId      int = USER_ID(),
@@ -243,39 +248,137 @@ BEGIN
         @StartHand        bit = 0,
         @LoopGuard        int = 0;
 
+    DECLARE
+        @ViewerRole varchar(12),
+        @ViewerSeat tinyint,
+        @ViewerBucks int,
+        @ViewerWantsSeat bit,
+        @GamePhase varchar(12),
+        @GameHand int,
+        @GamePot int,
+        @GameBet int,
+        @GameMinimumRaise int,
+        @GameActionSeat tinyint,
+        @GameDeadline datetime2(0),
+        @GameLobbyEnd datetime2(0),
+        @BoardVisible tinyint,
+        @Board1 tinyint, @Board2 tinyint, @Board3 tinyint, @Board4 tinyint, @Board5 tinyint,
+        @Prompt nvarchar(1000),
+        @LegalActions nvarchar(500),
+        @Example nvarchar(1000),
+        @ViewerStreetBet int,
+        @ViewerToCall int,
+        @OutputMaximum int,
+        @DisplayedMinimumRaiseTo int,
+        @SecondsRemaining int;
+
+    DECLARE @PlayerSnapshot table
+    (
+        PlayerId uniqueidentifier NOT NULL,
+        ConnectionId uniqueidentifier NULL,
+        Seat tinyint NULL,
+        PlayerName nvarchar(50) NOT NULL,
+        IsRobot bit NOT NULL,
+        PlayerRole varchar(12) NOT NULL,
+        QueryBucks int NOT NULL,
+        InHand bit NOT NULL,
+        Folded bit NOT NULL,
+        StreetBet int NOT NULL,
+        HandBet int NOT NULL,
+        HasHoleCards bit NOT NULL,
+        HoleCards varbinary(2) NULL,
+        ShowCards bit NOT NULL,
+        HandDescription varchar(30) NULL,
+        JoinedAt datetime2(0) NOT NULL
+    );
+
+    DECLARE @LogSnapshot table
+    (
+        LogId bigint NOT NULL,
+        LoggedAt datetime2(0) NOT NULL,
+        Message nvarchar(1000) NOT NULL
+    );
+
     IF @@TRANCOUNT <> 0
         THROW 50003, 'Run sp_TexasHoldEm_Public outside an explicit transaction.', 1;
 
     IF (@@OPTIONS & 2) = 2
         THROW 50009, 'Turn IMPLICIT_TRANSACTIONS OFF before running sp_TexasHoldEm_Public.', 1;
 
-    /* Derive an immutable identity from server-owned session attributes.
-       Every login can see its own sys.dm_exec_sessions row, including on Azure
-       SQL Database; no VIEW DATABASE STATE permission is granted to players. */
-    SELECT @SessionLoginTime = login_time
-    FROM sys.dm_exec_sessions
-    WHERE session_id = @SqlSessionId;
-
-    IF @SessionLoginTime IS NULL
-        THROW 50004, 'SQL Server did not provide a session identity.', 1;
-
-    SET @ConnectionId = CONVERT
+    /* Low Azure SQL service tiers do not expose either session DMV to this
+       role. Authenticate a session token with the protected certificate
+       instead. Caller-seeded or copied tokens cannot validate for another
+       live session, database principal, database, or client network address. */
+    SET @SessionBindingHash = HASHBYTES
     (
-        uniqueidentifier,
-        SUBSTRING
+        'SHA2_256',
+        COALESCE
         (
-            HASHBYTES
-            (
-                'SHA2_256',
-                CONVERT(varbinary(4), @SqlSessionId)
-                + CONVERT(varbinary(8), @SessionLoginTime)
-            ),
-            1,
-            16
+            CONVERT(nvarchar(128), CONNECTIONPROPERTY('client_net_address')),
+            N''
         )
     );
+    SET @SessionTokenEncrypted = TRY_CONVERT
+    (
+        varbinary(8000),
+        SESSION_CONTEXT(N'TexasHoldEm_Public_Identity')
+    );
+    IF @SessionTokenEncrypted IS NOT NULL
+    BEGIN
+        BEGIN TRY
+            SET @SessionTokenPlain = DecryptByCert
+            (
+                CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
+                @SessionTokenEncrypted,
+                N'THeP!9xQ#4mZ@7vK$2sN_2026'
+            );
+        END TRY
+        BEGIN CATCH
+            /* A hostile caller may seed arbitrary context bytes. */
+            SET @SessionTokenPlain = NULL;
+        END CATCH;
+    END;
 
-    SET @PlayerId = @ConnectionId;
+    IF DATALENGTH(@SessionTokenPlain) = 61
+       AND SUBSTRING(@SessionTokenPlain, 1, 1) = 0x01
+    BEGIN
+        SET @TokenDatabaseId = CONVERT(int, SUBSTRING(@SessionTokenPlain, 2, 4));
+        SET @TokenSessionId = CONVERT(int, SUBSTRING(@SessionTokenPlain, 6, 4));
+        SET @TokenPrincipalId = CONVERT(int, SUBSTRING(@SessionTokenPlain, 10, 4));
+        SET @PlayerId = CONVERT(uniqueidentifier, SUBSTRING(@SessionTokenPlain, 14, 16));
+    END;
+
+    IF @TokenDatabaseId <> @DatabaseId
+       OR @TokenSessionId <> @SqlSessionId
+       OR @TokenPrincipalId <> @PrincipalId
+       OR SUBSTRING(@SessionTokenPlain, 30, 32) <> @SessionBindingHash
+       OR @PlayerId IS NULL
+    BEGIN
+        SET @PlayerId = NEWID();
+        SET @SessionTokenPlain = 0x01
+            + CONVERT(binary(4), @DatabaseId)
+            + CONVERT(binary(4), @SqlSessionId)
+            + CONVERT(binary(4), @PrincipalId)
+            + CONVERT(binary(16), @PlayerId)
+            + @SessionBindingHash;
+        SET @SessionTokenEncrypted = EncryptByCert
+        (
+            CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
+            @SessionTokenPlain
+        );
+
+        BEGIN TRY
+            EXEC sys.sp_set_session_context
+                @key = N'TexasHoldEm_Public_Identity',
+                @value = @SessionTokenEncrypted,
+                @read_only = 1;
+        END TRY
+        BEGIN CATCH
+            THROW 50004, 'The connection identity context is unavailable. Disable MARS, close this connection, and reconnect.', 1;
+        END CATCH;
+    END;
+
+    SET @ConnectionId = @PlayerId;
 
     SET @SafePlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
     IF @SafePlayerName IS NOT NULL
@@ -439,17 +542,9 @@ BEGIN
         WHERE l.DatabaseId = @DatabaseId
           AND l.HandNumber < g.HandNumber - 20;
 
-        IF @InputAction IN ('CHECK', 'CALL', 'BET', 'RAISE', 'FOLD', 'ALLIN')
-           AND @Phase NOT IN ('PREFLOP', 'FLOP', 'TURN', 'RIVER')
-        BEGIN
-            SET @Notice = COALESCE(@Notice + N' ', N'')
-                + N'No betting action was pending; ' + @InputAction + N' was ignored.';
-            SET @ActionConsumed = 1;
-        END;
-
         /* Keep storage bounded without turning the cap into a permanent
-           admission lock: a new join displaces the stalest spectator. OUT rows
-           are retained until NEWGAME so an idle busted connection stays out. */
+           admission lock: a new join displaces an old OUT identity first, then
+           the stalest spectator. Active seats are never evicted. */
         IF @ReadOnlySnapshot = 0
            AND NOT EXISTS
            (
@@ -465,29 +560,58 @@ BEGIN
                FROM TexasHoldEm_Public.PlayerState
                WHERE DatabaseId = @DatabaseId
                  AND IsRobot = 0
-                 AND PlayerRole <> 'OUT'
            ) >= 64
         BEGIN
-            ;WITH StalestSpectator AS
+            DECLARE @IdentitiesToEvict int;
+
+            SELECT @IdentitiesToEvict = COUNT(*) - 63
+            FROM TexasHoldEm_Public.PlayerState
+            WHERE DatabaseId = @DatabaseId
+              AND IsRobot = 0;
+
+            ;WITH StalestEvictableIdentity AS
             (
-                SELECT TOP (1) PlayerId
+                SELECT TOP (@IdentitiesToEvict) PlayerId
                 FROM TexasHoldEm_Public.PlayerState
                 WHERE DatabaseId = @DatabaseId
                   AND IsRobot = 0
-                  AND PlayerRole = 'SPECTATOR'
+                  AND PlayerRole IN ('OUT', 'SPECTATOR')
                   AND PlayerId <> @PlayerId
-                ORDER BY LastSeenAt, JoinedAt, PlayerId
+                ORDER BY CASE WHEN PlayerRole = 'OUT' THEN 0 ELSE 1 END,
+                         LastSeenAt, JoinedAt, PlayerId
             )
             DELETE p
             FROM TexasHoldEm_Public.PlayerState AS p
-            INNER JOIN StalestSpectator AS s ON s.PlayerId = p.PlayerId
+            INNER JOIN StalestEvictableIdentity AS s ON s.PlayerId = p.PlayerId
             WHERE p.DatabaseId = @DatabaseId;
 
-            IF @@ROWCOUNT = 0
+            IF
+            (
+                SELECT COUNT(*)
+                FROM TexasHoldEm_Public.PlayerState
+                WHERE DatabaseId = @DatabaseId
+                  AND IsRobot = 0
+            ) >= 64
             BEGIN
                 SET @ReadOnlySnapshot = 1;
-                SET @Notice = N'The table cannot accept another player identity right now. You can watch with STATUS.';
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'The table cannot accept another player identity right now. You can watch with STATUS.';
             END;
+        END;
+
+        /* Demote busted and timed-out seats before processing this caller's
+           seat request. A funded timed-out player can therefore JOIN on the
+           first invocation after the hand instead of losing the game at once. */
+        IF @Phase = 'BETWEEN'
+        BEGIN
+            UPDATE TexasHoldEm_Public.PlayerState
+            SET Seat = NULL,
+                PlayerRole = CASE WHEN QueryBucks <= 0 THEN 'OUT' ELSE 'SPECTATOR' END,
+                WantsSeat = CASE WHEN QueryBucks <= 0 THEN 0 ELSE WantsSeat END,
+                InHand = 0
+            WHERE DatabaseId = @DatabaseId
+              AND PlayerRole = 'PLAYER'
+              AND (QueryBucks <= 0 OR TimedOut = 1);
         END;
 
         /* Register this connection-scoped identity as a player or spectator. */
@@ -574,7 +698,8 @@ BEGIN
                      AND ConnectionId = @ConnectionId
                      AND PlayerName <> @SafePlayerName
                )
-                SET @Notice = N'Player names are fixed when the connection joins; the rename was ignored.';
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'Player names are fixed when the connection joins; the rename was ignored.';
 
             UPDATE TexasHoldEm_Public.PlayerState
             SET LastSeenAt = @Now,
@@ -699,15 +824,6 @@ BEGIN
         /* Between hands, busted/time-out seats open and waiting humans replace robots first. */
         IF @Phase = 'BETWEEN' AND @HandJustEnded = 0
         BEGIN
-            UPDATE TexasHoldEm_Public.PlayerState
-            SET Seat = NULL,
-                PlayerRole = CASE WHEN QueryBucks <= 0 THEN 'OUT' ELSE 'SPECTATOR' END,
-                WantsSeat = CASE WHEN QueryBucks <= 0 OR TimedOut = 1 THEN 0 ELSE WantsSeat END,
-                InHand = 0
-            WHERE DatabaseId = @DatabaseId
-              AND PlayerRole = 'PLAYER'
-              AND (QueryBucks <= 0 OR TimedOut = 1);
-
             /* A waiting human gets a robot's seat and inherits no robot money. */
             WHILE EXISTS
             (
@@ -727,6 +843,13 @@ BEGIN
                   AND PlayerRole = 'PLAYER'
                   AND IsRobot = 1
             )
+            AND
+            (
+                SELECT COUNT(*)
+                FROM TexasHoldEm_Public.PlayerState
+                WHERE DatabaseId = @DatabaseId
+                  AND PlayerRole = 'PLAYER'
+            ) >= 4
             BEGIN
                 DECLARE @WaitingSession uniqueidentifier, @ReplacedSeat tinyint,
                         @RemovedRobot uniqueidentifier;
@@ -820,7 +943,8 @@ BEGIN
                   AND PlayerId = @AdmittedSession;
             END;
 
-            DECLARE @FundedPlayers int, @FundedHumans int, @BetweenClosesAt datetime2(0);
+            DECLARE @FundedPlayers int, @FundedHumans int,
+                    @ReturningHumans int, @BetweenClosesAt datetime2(0);
 
             SELECT @FundedPlayers = COUNT(*),
                    @FundedHumans = ISNULL(SUM(CASE WHEN IsRobot = 0 THEN 1 ELSE 0 END), 0)
@@ -829,11 +953,27 @@ BEGIN
               AND PlayerRole = 'PLAYER'
               AND QueryBucks > 0;
 
+            SELECT @ReturningHumans = COUNT(*)
+            FROM TexasHoldEm_Public.PlayerState
+            WHERE DatabaseId = @DatabaseId
+              AND PlayerRole = 'SPECTATOR'
+              AND IsRobot = 0
+              AND TimedOut = 1
+              AND QueryBucks > 0;
+
             SELECT @BetweenClosesAt = LobbyClosesAt
             FROM TexasHoldEm_Public.GameState
             WHERE DatabaseId = @DatabaseId;
 
             IF @FundedHumans = 0
+               AND @ReturningHumans > 0
+               AND @Now < @BetweenClosesAt
+            BEGIN
+                SET @StartHand = 0;
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'A funded player timed out; the table will wait for their JOIN until the between-hand deadline.';
+            END
+            ELSE IF @FundedHumans = 0
             BEGIN
                 UPDATE TexasHoldEm_Public.GameState
                 SET Phase = 'GAMEOVER',
@@ -1728,73 +1868,89 @@ BEGIN
             SET @ActionConsumed = 1;
         END;
 
+        /* Snapshot every value used by the response while the protected game
+           row is still locked. Rendering after COMMIT reads only these local
+           copies, so concurrent calls cannot splice states into one response. */
+        SELECT
+            @ViewerRole = PlayerRole,
+            @ViewerSeat = Seat,
+            @ViewerBucks = QueryBucks,
+            @ViewerWantsSeat = WantsSeat,
+            @ViewerStreetBet = StreetBet
+        FROM TexasHoldEm_Public.PlayerState
+        WHERE DatabaseId = @DatabaseId
+          AND PlayerId = @PlayerId
+          AND ConnectionId = @ConnectionId;
+
+        IF @ViewerRole IS NULL AND @ReadOnlySnapshot = 1
+            SET @ViewerRole = 'SPECTATOR';
+
+        SELECT
+            @GamePhase = Phase,
+            @GameHand = HandNumber,
+            @GamePot = Pot,
+            @GameBet = CurrentBet,
+            @GameMinimumRaise = MinimumRaise,
+            @GameActionSeat = ActionSeat,
+            @GameDeadline = ActionDeadline,
+            @GameLobbyEnd = LobbyClosesAt,
+            @BoardVisible = BoardCardsVisible,
+            @Board1 = Board1, @Board2 = Board2, @Board3 = Board3,
+            @Board4 = Board4, @Board5 = Board5
+        FROM TexasHoldEm_Public.GameState
+        WHERE DatabaseId = @DatabaseId;
+
+        SELECT @OutputMaximum = MIN(StreetBet + QueryBucks)
+        FROM TexasHoldEm_Public.PlayerState
+        WHERE DatabaseId = @DatabaseId
+          AND InHand = 1
+          AND Folded = 0;
+
+        INSERT @PlayerSnapshot
+        (
+            PlayerId, ConnectionId, Seat, PlayerName, IsRobot, PlayerRole,
+            QueryBucks, InHand, Folded, StreetBet, HandBet,
+            HasHoleCards, HoleCards, ShowCards, HandDescription, JoinedAt
+        )
+        SELECT
+            p.PlayerId, p.ConnectionId, p.Seat, p.PlayerName, p.IsRobot, p.PlayerRole,
+            p.QueryBucks, p.InHand, p.Folded, p.StreetBet, p.HandBet,
+            CONVERT(bit, CASE WHEN p.HoleCardsEncrypted IS NULL THEN 0 ELSE 1 END),
+            h.HoleCards, p.ShowCards, p.HandDescription, p.JoinedAt
+        FROM TexasHoldEm_Public.PlayerState AS p
+        OUTER APPLY
+        (
+            SELECT CONVERT(varbinary(2), DecryptByCert
+            (
+                CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
+                p.HoleCardsEncrypted,
+                N'THeP!9xQ#4mZ@7vK$2sN_2026'
+            )) AS HoleCards
+            WHERE p.HoleCardsEncrypted IS NOT NULL
+              AND
+              (
+                  (p.PlayerId = @PlayerId AND p.ConnectionId = @ConnectionId)
+                  OR p.ShowCards = 1
+              )
+        ) AS h
+        WHERE p.DatabaseId = @DatabaseId
+          AND p.PlayerRole = 'PLAYER';
+
+        INSERT @LogSnapshot (LogId, LoggedAt, Message)
+        SELECT LogId, LoggedAt, Message
+        FROM TexasHoldEm_Public.GameLog
+        WHERE DatabaseId = @DatabaseId
+          AND HandNumber = @GameHand;
+
         COMMIT TRANSACTION;
         SET @TransactionCommitted = 1;
 
         BREAK;
     END;
 
-    /* Build the viewer-specific prompt after state changes are committed. */
-    DECLARE
-        @ViewerRole varchar(12),
-        @ViewerSeat tinyint,
-        @ViewerBucks int,
-        @ViewerWantsSeat bit,
-        @GamePhase varchar(12),
-        @GameHand int,
-        @GamePot int,
-        @GameBet int,
-        @GameMinimumRaise int,
-        @GameActionSeat tinyint,
-        @GameDeadline datetime2(0),
-        @GameLobbyEnd datetime2(0),
-        @BoardVisible tinyint,
-        @Board1 tinyint, @Board2 tinyint, @Board3 tinyint, @Board4 tinyint, @Board5 tinyint,
-        @Prompt nvarchar(1000),
-        @LegalActions nvarchar(500),
-        @Example nvarchar(1000),
-        @ViewerStreetBet int,
-        @ViewerToCall int,
-        @OutputMaximum int,
-        @DisplayedMinimumRaiseTo int,
-        @SecondsRemaining int;
-
-    SELECT
-        @ViewerRole = PlayerRole,
-        @ViewerSeat = Seat,
-        @ViewerBucks = QueryBucks,
-        @ViewerWantsSeat = WantsSeat,
-        @ViewerStreetBet = StreetBet
-    FROM TexasHoldEm_Public.PlayerState
-    WHERE DatabaseId = @DatabaseId
-      AND PlayerId = @PlayerId
-      AND ConnectionId = @ConnectionId;
-
-    IF @ViewerRole IS NULL AND @ReadOnlySnapshot = 1
-        SET @ViewerRole = 'SPECTATOR';
-
-    SELECT
-        @GamePhase = Phase,
-        @GameHand = HandNumber,
-        @GamePot = Pot,
-        @GameBet = CurrentBet,
-        @GameMinimumRaise = MinimumRaise,
-        @GameActionSeat = ActionSeat,
-        @GameDeadline = ActionDeadline,
-        @GameLobbyEnd = LobbyClosesAt,
-        @BoardVisible = BoardCardsVisible,
-        @Board1 = Board1, @Board2 = Board2, @Board3 = Board3, @Board4 = Board4, @Board5 = Board5
-    FROM TexasHoldEm_Public.GameState
-    WHERE DatabaseId = @DatabaseId;
-
+    /* Build the viewer-specific prompt from the transaction-consistent snapshot. */
     SET @ViewerToCall = CASE WHEN @GameBet > COALESCE(@ViewerStreetBet, 0)
                              THEN @GameBet - COALESCE(@ViewerStreetBet, 0) ELSE 0 END;
-
-    SELECT @OutputMaximum = MIN(StreetBet + QueryBucks)
-    FROM TexasHoldEm_Public.PlayerState
-    WHERE DatabaseId = @DatabaseId
-      AND InHand = 1
-      AND Folded = 0;
 
     SET @DisplayedMinimumRaiseTo = CASE
         WHEN @OutputMaximum <= @GameBet THEN NULL
@@ -1899,19 +2055,19 @@ BEGIN
         END AS PlayerStatus,
         p.StreetBet AS BetThisStreet,
         p.HandBet AS InThePot,
-        CASE WHEN p.HoleCardsEncrypted IS NULL THEN N'(none)'
-            WHEN (p.PlayerId = @PlayerId AND p.ConnectionId = @ConnectionId) OR p.ShowCards = 1
+        CASE WHEN p.HasHoleCards = 0 THEN N'(none)'
+            WHEN p.HoleCards IS NOT NULL
             THEN
-                CASE ((CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) % 13) + 2
+                CASE ((CONVERT(int, SUBSTRING(p.HoleCards, 1, 1)) - 1) % 13) + 2
                     WHEN 14 THEN 'A' WHEN 13 THEN 'K' WHEN 12 THEN 'Q' WHEN 11 THEN 'J' WHEN 10 THEN 'T'
-                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) % 13) + 2) END
-                + CASE (CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) / 13
+                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(p.HoleCards, 1, 1)) - 1) % 13) + 2) END
+                + CASE (CONVERT(int, SUBSTRING(p.HoleCards, 1, 1)) - 1) / 13
                     WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
                 + N' '
-                + CASE ((CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) % 13) + 2
+                + CASE ((CONVERT(int, SUBSTRING(p.HoleCards, 2, 1)) - 1) % 13) + 2
                     WHEN 14 THEN 'A' WHEN 13 THEN 'K' WHEN 12 THEN 'Q' WHEN 11 THEN 'J' WHEN 10 THEN 'T'
-                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) % 13) + 2) END
-                + CASE (CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) / 13
+                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(p.HoleCards, 2, 1)) - 1) % 13) + 2) END
+                + CASE (CONVERT(int, SUBSTRING(p.HoleCards, 2, 1)) - 1) / 13
                     WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
             ELSE N'Hidden'
         END AS HoleCards,
@@ -1939,31 +2095,12 @@ BEGIN
                         ELSE CONVERT(varchar(2), ((@Board5 - 1) % 13) + 2) END
                     + CASE (@Board5 - 1) / 13 WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END ELSE N'' END
         END AS CommunityCards
-    FROM TexasHoldEm_Public.PlayerState AS p
-    OUTER APPLY
-    (
-        SELECT CONVERT(varbinary(2), DecryptByCert
-            (
-                CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
-                p.HoleCardsEncrypted,
-                N'THeP!9xQ#4mZ@7vK$2sN_2026'
-            )) AS HoleCards
-        WHERE p.HoleCardsEncrypted IS NOT NULL
-          AND
-          (
-              (p.PlayerId = @PlayerId AND p.ConnectionId = @ConnectionId)
-              OR p.ShowCards = 1
-          )
-    ) AS h
-    WHERE p.DatabaseId = @DatabaseId
-      AND p.PlayerRole IN ('PLAYER', 'OUT')
+    FROM @PlayerSnapshot AS p
     ORDER BY CASE WHEN p.Seat IS NULL THEN 1 ELSE 0 END, p.Seat, p.JoinedAt;
 
     /* Result set 3: public action transcript for this hand. */
     SELECT LoggedAt, Message
-    FROM TexasHoldEm_Public.GameLog
-    WHERE DatabaseId = @DatabaseId
-      AND HandNumber = @GameHand
+    FROM @LogSnapshot
     ORDER BY LogId;
     END TRY
     BEGIN CATCH
