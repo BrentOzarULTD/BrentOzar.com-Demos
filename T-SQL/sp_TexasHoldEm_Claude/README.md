@@ -3,6 +3,19 @@
 Multiplayer fixed-limit Texas Hold 'Em, played entirely inside SQL Server
 Management Studio. Each query window is a player. Yes, really.
 
+Two builds live in this folder:
+
+- **[sp_TexasHoldEm.sql](sp_TexasHoldEm.sql)** — the original. Game state
+  lives in global temp tables, zero permanent objects, perfect for playing
+  with people you trust. Anyone connected can also `SELECT` everyone's hole
+  cards, `UPDATE` their own chips, or `DROP` the casino, so only run it with
+  people you trust. Preserved here for historical purposes.
+- **[sp_TexasHoldEm_Public.sql](sp_TexasHoldEm_Public.sql)** — the hardened
+  build for hosting a game on the open internet, where the players are
+  hostile strangers who know T-SQL. See
+  [Hosting for the public](#hosting-for-the-public-sp_texasholdem_public)
+  below.
+
 ## Quick start
 
 1. Create [sp_TexasHoldEm.sql](sp_TexasHoldEm.sql) in any user database.
@@ -79,6 +92,56 @@ Management Studio. Each query window is a player. Yes, really.
   shot clock (the clock is enforced whenever *any* session's query is
   running — in a solo game against the robots, nothing moves while your
   query isn't running, so take your time).
+
+## Hosting for the public (sp_TexasHoldEm_Public)
+
+The original trusts every session in the database, because global temp
+tables have no permissions: any player can read hole cards, forge chips, or
+drop the game. The public build assumes the opposite — every player is
+hostile and fluent in T-SQL — and changes the design accordingly:
+
+- **Real tables + ownership chaining.** Game state moves to
+  `dbo.TexasHoldEm_Game`, `_Players`, and `_Log`, created by an admin.
+  Players get `GRANT EXECUTE` on the proc and *nothing else*: the proc can
+  touch the tables (same owner), the players can't. No card peeking, no
+  chip forging, no dropping the casino — and the game survives disconnects,
+  so nobody's session is load-bearing anymore.
+- **Seat passwords.** Reclaiming a seat by `@PlayerName` from a new session
+  now requires the optional `@SeatPassword` you joined with (salted SHA-256
+  in the table). No password, no reclaim, no hijacking someone's stack.
+- **Real session identity.** SQL Server recycles `session_id`s, so seats are
+  bound to `session_id` + `login_time` — a recycled id can't inherit a seat.
+- **No take-backs.** The proc refuses to run inside a caller's transaction
+  (goodbye, `ROLLBACK`-your-losing-bet trick) and resets hostile session
+  settings like `SET ROWCOUNT 1` that would quietly maim the engine.
+- **Un-jammable lock.** The `sp_getapplock` resource name is a random GUID
+  stored where players can't read it, so nobody can grab the lock outside
+  the proc and hold the game hostage.
+- **Boring names.** Player names are limited to letters, digits, single
+  spaces, dots, dashes, and underscores — no control characters, quotes, or
+  Unicode homoglyphs for forging log lines or impersonating players.
+- **Janitorial service.** Abandoned tables get swept after 30 minutes, the
+  log is trimmed so it doesn't grow forever, and waiting queries give up
+  after 30 minutes to hand their worker threads back.
+
+Setup (as an admin, in the database that hosts the game): run the whole
+script — it creates the three tables plus the proc, and re-running it won't
+wipe a game in progress. Then create a login for the public and grant it
+exactly one thing:
+
+```sql
+-- In master:
+CREATE LOGIN PokerPublic WITH PASSWORD = N'something long and weird';
+-- In the game database:
+CREATE USER PokerPublic FOR LOGIN PokerPublic;
+GRANT EXECUTE ON OBJECT::dbo.sp_TexasHoldEm_Public TO PokerPublic;
+```
+
+Don't add that user to any database roles, don't grant `VIEW DATABASE
+STATE`, and don't add `EXECUTE AS` to the proc (it would break the
+session-identity check). What hostile players can still do: play badly,
+stall (the shot clock folds them), and open lots of connections — so host
+it in a small, cheap database that shares hardware with nothing you love.
 
 ## How it works, briefly
 
