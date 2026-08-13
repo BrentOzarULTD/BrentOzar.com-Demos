@@ -221,9 +221,9 @@ BEGIN
 
     DECLARE
         @DatabaseId       int = DB_ID(),
-        @SqlSessionId        int = @@SPID,
-        @ConnectionId     uniqueidentifier = TRY_CONVERT(uniqueidentifier, CONVERT(binary(16), CONTEXT_INFO())),
-        @PlayerId         uniqueidentifier = TRY_CONVERT(uniqueidentifier, SESSION_CONTEXT(N'TexasHoldEm_Public_PlayerId')),
+        @SqlSessionId     int = @@SPID,
+        @ConnectionId     uniqueidentifier,
+        @PlayerId         uniqueidentifier,
         @PrincipalId      int = USER_ID(),
         @SafePlayerName   nvarchar(50),
         @ResolvedPlayerName nvarchar(50),
@@ -245,19 +245,18 @@ BEGIN
     IF (@@OPTIONS & 2) = 2
         THROW 50009, 'Turn IMPLICIT_TRANSACTIONS OFF before running sp_TexasHoldEm_Public.', 1;
 
-    IF @PlayerId IS NULL
-    BEGIN
-        SET @PlayerId = NEWID();
-        EXEC sys.sp_set_session_context
-            @key = N'TexasHoldEm_Public_PlayerId',
-            @value = @PlayerId,
-            @read_only = 1;
-    END;
+    /* The current request's connection_id is server-owned and immutable.
+       CONTEXT_INFO and SESSION_CONTEXT are intentionally not trusted because
+       hostile callers can set either value before invoking the procedure. */
+    SELECT @ConnectionId = connection_id
+    FROM sys.dm_exec_requests
+    WHERE session_id = @SqlSessionId
+      AND request_id = CURRENT_REQUEST_ID();
 
-    /* Azure SQL Database supplies a session-specific GUID in CONTEXT_INFO by
-       default. The fallback keeps local SQL Server demos working as well. */
     IF @ConnectionId IS NULL
-        SET @ConnectionId = @PlayerId;
+        THROW 50004, 'SQL Server did not provide a connection identity.', 1;
+
+    SET @PlayerId = @ConnectionId;
 
     SET @SafePlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
     IF @SafePlayerName IS NOT NULL
@@ -380,11 +379,20 @@ BEGIN
         FROM TexasHoldEm_Public.GameState
         WHERE DatabaseId = @DatabaseId;
 
+        /* Preserve active spectators' queue positions before stale-row cleanup,
+           including STATUS calls that deliberately do not change seat intent. */
+        UPDATE TexasHoldEm_Public.PlayerState
+        SET LastSeenAt = @Now
+        WHERE DatabaseId = @DatabaseId
+          AND PlayerId = @PlayerId
+          AND ConnectionId = @ConnectionId;
+
         /* Bound persistent storage created by drive-by and abandoned sessions. */
         DELETE FROM TexasHoldEm_Public.PlayerState
         WHERE DatabaseId = @DatabaseId
           AND IsRobot = 0
           AND PlayerRole <> 'PLAYER'
+          AND PlayerId <> @PlayerId
           AND LastSeenAt < DATEADD(minute, -10, @Now);
 
         DELETE l
@@ -1641,6 +1649,19 @@ BEGIN
             WHERE DatabaseId = @DatabaseId;
         END;
 
+        /* The pot has been awarded. Keep showdown cards/descriptions available,
+           but do not present completed-hand wagers and fold state as current. */
+        IF @HandJustEnded = 1
+        BEGIN
+            UPDATE TexasHoldEm_Public.PlayerState
+            SET InHand = 0,
+                Folded = 0,
+                StreetBet = 0,
+                HandBet = 0,
+                ActedThisStreet = 0
+            WHERE DatabaseId = @DatabaseId;
+        END;
+
         IF @InputAction IN ('CHECK', 'CALL', 'BET', 'RAISE', 'FOLD', 'ALLIN')
            AND @ActionConsumed = 0
         BEGIN
@@ -1862,18 +1883,21 @@ BEGIN
                     + CASE (@Board5 - 1) / 13 WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END ELSE N'' END
         END AS CommunityCards
     FROM TexasHoldEm_Public.PlayerState AS p
-    CROSS APPLY
+    OUTER APPLY
     (
-        VALUES
-        (
-            CONVERT(varbinary(2), DecryptByCert
+        SELECT CONVERT(varbinary(2), DecryptByCert
             (
                 CERT_ID(N'sp_TexasHoldEm_CardProtection_Public'),
                 p.HoleCardsEncrypted,
                 N'QueryBucks-Public-demo-certificate-2026!'
-            ))
-        )
-    ) AS h(HoleCards)
+            )) AS HoleCards
+        WHERE p.HoleCardsEncrypted IS NOT NULL
+          AND
+          (
+              (p.PlayerId = @PlayerId AND p.ConnectionId = @ConnectionId)
+              OR p.ShowCards = 1
+          )
+    ) AS h
     WHERE p.DatabaseId = @DatabaseId
       AND p.PlayerRole IN ('PLAYER', 'OUT')
     ORDER BY CASE WHEN p.Seat IS NULL THEN 1 ELSE 0 END, p.Seat, p.JoinedAt;
