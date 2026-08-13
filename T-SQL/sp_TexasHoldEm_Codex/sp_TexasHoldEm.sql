@@ -546,9 +546,10 @@ BEGIN
                   AND SessionId = @AdmittedSession;
             END;
 
-            DECLARE @FundedPlayers int, @BetweenClosesAt datetime2(0);
+            DECLARE @FundedPlayers int, @FundedHumans int, @BetweenClosesAt datetime2(0);
 
-            SELECT @FundedPlayers = COUNT(*)
+            SELECT @FundedPlayers = COUNT(*),
+                   @FundedHumans = ISNULL(SUM(CASE WHEN IsRobot = 0 THEN 1 ELSE 0 END), 0)
             FROM ##TexasHoldEm_Players_Codex_v1
             WHERE DatabaseId = @DatabaseId
               AND PlayerRole = 'PLAYER'
@@ -558,7 +559,24 @@ BEGIN
             FROM ##TexasHoldEm_Game_Codex_v1
             WHERE DatabaseId = @DatabaseId;
 
-            IF @FundedPlayers >= 2
+            IF @FundedHumans = 0
+            BEGIN
+                UPDATE ##TexasHoldEm_Game_Codex_v1
+                SET Phase = 'GAMEOVER',
+                    ActionSeat = NULL,
+                    ActionDeadline = NULL,
+                    LastChangedAt = @Now
+                WHERE DatabaseId = @DatabaseId;
+
+                INSERT ##TexasHoldEm_Log_Codex_v1 (DatabaseId, HandNumber, LoggedAt, Message)
+                SELECT @DatabaseId, HandNumber, @Now,
+                    N'No funded humans remain. The robots win.'
+                FROM ##TexasHoldEm_Game_Codex_v1
+                WHERE DatabaseId = @DatabaseId;
+
+                SET @Phase = 'GAMEOVER';
+            END
+            ELSE IF @FundedPlayers >= 2
                 SET @StartHand = 1;
             ELSE IF @Now < @BetweenClosesAt
                 SET @KeepWaiting = 1;
