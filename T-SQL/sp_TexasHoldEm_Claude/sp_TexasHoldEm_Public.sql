@@ -214,6 +214,7 @@ DECLARE @rc int,
         @Msg nvarchar(2047),
         @Notice nvarchar(500),
         @LockResource nvarchar(60),
+        @GameRows int,
         @MyLoginTime datetime2,
         @MySeat tinyint,
         @MyInHand bit,
@@ -326,7 +327,9 @@ BEGIN
     RETURN;
 END
 
-IF UPPER(@PlayerName) IN (N'CLIPPY', N'HAL', N'BENDER')
+/* Explicit CI collation: under a Turkish database collation, UPPER('clippy')
+   yields CLİPPY (dotted İ), which would sneak past a default-collation check. */
+IF @PlayerName COLLATE Latin1_General_100_CI_AS IN (N'Clippy', N'HAL', N'Bender')
 BEGIN
     SELECT [Nice Try] = CONCAT(@PlayerName, N' is one of the house robots. Pick a different name.');
     RETURN;
@@ -361,11 +364,16 @@ BEGIN CATCH
 END CATCH
 
 /* The applock's name is random and stored where players can't read it, so
-   nobody can grab the lock outside this proc and jam the game. */
-SELECT @LockResource = ApplockResource FROM dbo.TexasHoldEm_Game;
-IF @LockResource IS NULL
+   nobody can grab the lock outside this proc and jam the game. The whole
+   proc assumes dbo.TexasHoldEm_Game holds exactly ONE row; if an admin's
+   been improvising in there, fail fast instead of playing nondeterministic
+   poker with whichever row each session happens to read. */
+SELECT @GameRows = COUNT(*), @LockResource = MAX(ApplockResource) FROM dbo.TexasHoldEm_Game;
+IF @GameRows <> 1 OR @LockResource IS NULL
 BEGIN
-    SELECT [Not Deployed] = N'The dbo.TexasHoldEm_Game table has no game row. An admin needs to re-run the full setup script to finish building the casino.';
+    SELECT [Not Deployed] = CASE WHEN @GameRows > 1
+        THEN N'The dbo.TexasHoldEm_Game table has more than one row, and this casino only knows how to run one game. An admin needs to delete the extras (keep the row whose ApplockResource everyone should share).'
+        ELSE N'The dbo.TexasHoldEm_Game table has no game row. An admin needs to re-run the full setup script to finish building the casino.' END;
     RETURN;
 END
 
