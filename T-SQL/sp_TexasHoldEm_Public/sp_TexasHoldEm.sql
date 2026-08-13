@@ -41,9 +41,10 @@ Simplifications:
   * There are no side pots. The maximum street wager is capped at the amount
     the shortest live stack can cover.
   * Robots use a deliberately simple strategy.
-  * Turn and one-player-between-hands waits expire after 60 seconds, but an
-    invocation is required to observe and process expiry. Lobby calls return
-    immediately; clients should poll with STATUS instead of tying up a worker.
+  * Turn, showdown-acknowledgement, and one-player-between-hands waits expire
+    after 60 seconds, but an invocation is required to observe and process
+    expiry. Lobby calls return immediately; clients should poll with STATUS
+    instead of tying up a worker.
   * A timed-out human folds, leaves the table after the hand, and may request
     a seat again by invoking the procedure if they still have QueryBucks.
   * One SQL connection is one game identity. A new connection joins separately.
@@ -147,6 +148,10 @@ BEGIN
         HandDescription    varchar(30) NULL,
         JoinedAt           datetime2(0) NOT NULL,
         LastSeenAt         datetime2(0) NOT NULL,
+        LastViewedHand     int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Public_PlayerState_LastViewedHand DEFAULT (0),
+        LastPlayedHand     int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Public_PlayerState_LastPlayedHand DEFAULT (0),
         CONSTRAINT PK_TexasHoldEm_Public_PlayerState
             PRIMARY KEY (DatabaseId, PlayerId),
         CONSTRAINT FK_TexasHoldEm_Public_PlayerState_GameState
@@ -156,7 +161,8 @@ BEGIN
         CONSTRAINT CK_TexasHoldEm_Public_PlayerState_Role
             CHECK (PlayerRole IN ('PLAYER', 'SPECTATOR', 'OUT')),
         CONSTRAINT CK_TexasHoldEm_Public_PlayerState_Amounts
-            CHECK (QueryBucks >= 0 AND StreetBet >= 0 AND HandBet >= 0),
+            CHECK (QueryBucks >= 0 AND StreetBet >= 0 AND HandBet >= 0
+               AND LastViewedHand >= 0 AND LastPlayedHand >= 0),
         CONSTRAINT CK_TexasHoldEm_Public_PlayerState_Identity
             CHECK ((IsRobot = 1 AND ConnectionId IS NULL AND SqlSessionId IS NULL AND PrincipalId IS NULL)
                 OR (IsRobot = 0 AND ConnectionId IS NOT NULL AND SqlSessionId IS NOT NULL AND PrincipalId IS NOT NULL))
@@ -173,6 +179,25 @@ BEGIN
     CREATE UNIQUE INDEX UX_TexasHoldEm_Public_PlayerState_Name
         ON TexasHoldEm_Public.PlayerState(DatabaseId, PlayerName)
         WHERE IsRobot = 0;
+END;
+GO
+
+/* Upgrade installations created before per-player showdown acknowledgement. */
+IF COL_LENGTH(N'TexasHoldEm_Public.PlayerState', N'LastPlayedHand') IS NULL
+BEGIN
+    ALTER TABLE TexasHoldEm_Public.PlayerState
+        ADD LastPlayedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Public_PlayerState_LastPlayedHand DEFAULT (0)
+            WITH VALUES;
+END;
+GO
+
+IF COL_LENGTH(N'TexasHoldEm_Public.PlayerState', N'LastViewedHand') IS NULL
+BEGIN
+    ALTER TABLE TexasHoldEm_Public.PlayerState
+        ADD LastViewedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Public_PlayerState_LastViewedHand DEFAULT (0)
+            WITH VALUES;
 END;
 GO
 
@@ -243,7 +268,6 @@ BEGIN
         @ActionConsumed   bit = 0,
         @Phase            varchar(12),
         @Notice           nvarchar(4000) = NULL,
-        @TransactionCommitted bit = 0,
         @HandJustEnded    bit = 0,
         @StartHand        bit = 0,
         @LoopGuard        int = 0;
@@ -414,7 +438,7 @@ BEGIN
     SET @ResolvedPlayerName = COALESCE
     (
         @SafePlayerName,
-        N'Player ' + RIGHT(REPLACE(CONVERT(nvarchar(36), @PlayerId), N'-', N''), 16)
+        N'Player ' + RIGHT(REPLACE(CONVERT(nvarchar(36), @PlayerId), N'-', N''), 23)
     );
 
     SET @OriginalAction = UPPER(LTRIM(RTRIM(COALESCE(@Action, ''))));
@@ -527,13 +551,32 @@ BEGIN
           AND PlayerId = @PlayerId
           AND ConnectionId = @ConnectionId;
 
-        /* Bound persistent storage created by drive-by and abandoned sessions. */
+        /* Bound persistent storage created by drive-by and abandoned sessions.
+           OUT identities get a longer grace period to discourage quick rebuys
+           without reserving abandoned names forever. */
         DELETE FROM TexasHoldEm_Public.PlayerState
         WHERE DatabaseId = @DatabaseId
           AND IsRobot = 0
-          AND PlayerRole = 'SPECTATOR'
           AND PlayerId <> @PlayerId
-          AND LastSeenAt < DATEADD(minute, -10, @Now);
+          AND
+          (
+              @Phase <> 'BETWEEN'
+              OR LastPlayedHand <
+                 (
+                     SELECT HandNumber
+                     FROM TexasHoldEm_Public.GameState
+                     WHERE DatabaseId = @DatabaseId
+                 )
+          )
+          AND
+          (
+              (PlayerRole = 'SPECTATOR' AND LastSeenAt < DATEADD(minute, -10, @Now))
+              OR
+              (
+                  PlayerRole = 'OUT'
+                  AND LastSeenAt < DATEADD(minute, -60, @Now)
+              )
+          );
 
         DELETE l
         FROM TexasHoldEm_Public.GameLog AS l
@@ -577,6 +620,16 @@ BEGIN
                   AND IsRobot = 0
                   AND PlayerRole IN ('OUT', 'SPECTATOR')
                   AND PlayerId <> @PlayerId
+                  AND
+                  (
+                      @Phase <> 'BETWEEN'
+                      OR LastPlayedHand <
+                         (
+                             SELECT HandNumber
+                             FROM TexasHoldEm_Public.GameState
+                             WHERE DatabaseId = @DatabaseId
+                         )
+                  )
                 ORDER BY CASE WHEN PlayerRole = 'OUT' THEN 0 ELSE 1 END,
                          LastSeenAt, JoinedAt, PlayerId
             )
@@ -635,7 +688,12 @@ BEGIN
                   AND IsRobot = 0
                   AND PlayerName = @ResolvedPlayerName
             )
-                THROW 50007, 'That player name is already in use.', 1;
+            BEGIN
+                SET @ResolvedPlayerName = N'Player '
+                    + RIGHT(REPLACE(CONVERT(nvarchar(36), @PlayerId), N'-', N''), 23);
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'That player name is already in use; a generated name was assigned.';
+            END;
 
             IF @Phase = 'LOBBY'
                AND @SeatRequested = 1
@@ -824,8 +882,25 @@ BEGIN
         /* Between hands, busted/time-out seats open and waiting humans replace robots first. */
         IF @Phase = 'BETWEEN' AND @HandJustEnded = 0
         BEGIN
+            DECLARE @FundedPlayers int, @FundedHumans int,
+                    @ReturningHumans int, @UnviewedHumans int,
+                    @BetweenClosesAt datetime2(0), @BetweenHand int;
+
+            SELECT @BetweenClosesAt = LobbyClosesAt,
+                   @BetweenHand = HandNumber
+            FROM TexasHoldEm_Public.GameState
+            WHERE DatabaseId = @DatabaseId;
+
+            SELECT @UnviewedHumans = COUNT(*)
+            FROM TexasHoldEm_Public.PlayerState
+            WHERE DatabaseId = @DatabaseId
+              AND IsRobot = 0
+              AND LastPlayedHand = @BetweenHand
+              AND LastViewedHand < @BetweenHand;
+
             /* A waiting human gets a robot's seat and inherits no robot money. */
-            WHILE EXISTS
+            WHILE (@Now >= @BetweenClosesAt OR @UnviewedHumans = 0)
+            AND EXISTS
             (
                 SELECT 1
                 FROM TexasHoldEm_Public.PlayerState
@@ -895,7 +970,8 @@ BEGIN
             END;
 
             /* Fill genuinely empty seats from the waiting list. */
-            WHILE (SELECT COUNT(*)
+            WHILE (@Now >= @BetweenClosesAt OR @UnviewedHumans = 0)
+              AND (SELECT COUNT(*)
                    FROM TexasHoldEm_Public.PlayerState
                    WHERE DatabaseId = @DatabaseId
                      AND PlayerRole = 'PLAYER'
@@ -943,9 +1019,6 @@ BEGIN
                   AND PlayerId = @AdmittedSession;
             END;
 
-            DECLARE @FundedPlayers int, @FundedHumans int,
-                    @ReturningHumans int, @BetweenClosesAt datetime2(0);
-
             SELECT @FundedPlayers = COUNT(*),
                    @FundedHumans = ISNULL(SUM(CASE WHEN IsRobot = 0 THEN 1 ELSE 0 END), 0)
             FROM TexasHoldEm_Public.PlayerState
@@ -960,10 +1033,6 @@ BEGIN
               AND IsRobot = 0
               AND TimedOut = 1
               AND QueryBucks > 0;
-
-            SELECT @BetweenClosesAt = LobbyClosesAt
-            FROM TexasHoldEm_Public.GameState
-            WHERE DatabaseId = @DatabaseId;
 
             IF @FundedHumans = 0
                AND @ReturningHumans > 0
@@ -990,10 +1059,11 @@ BEGIN
 
                 SET @Phase = 'GAMEOVER';
             END
+            ELSE IF @Now < @BetweenClosesAt
+                 AND (@FundedPlayers < 2 OR @UnviewedHumans > 0)
+                SET @StartHand = 0;
             ELSE IF @FundedPlayers >= 2
                 SET @StartHand = 1;
-            ELSE IF @Now < @BetweenClosesAt
-                SET @StartHand = 0;
             ELSE
             BEGIN
                 DECLARE @Champion nvarchar(50);
@@ -1042,6 +1112,10 @@ BEGIN
 
             UPDATE TexasHoldEm_Public.PlayerState
             SET InHand = CASE WHEN PlayerRole = 'PLAYER' AND QueryBucks > 0 THEN 1 ELSE 0 END,
+                LastPlayedHand = CASE
+                    WHEN PlayerRole = 'PLAYER' AND QueryBucks > 0 THEN @NewHand
+                    ELSE LastPlayedHand
+                END,
                 Folded = 0,
                 TimedOut = 0,
                 HoleCardsEncrypted = NULL,
@@ -1934,7 +2008,11 @@ BEGIN
               )
         ) AS h
         WHERE p.DatabaseId = @DatabaseId
-          AND p.PlayerRole = 'PLAYER';
+          AND
+          (
+              p.PlayerRole = 'PLAYER'
+              OR (@GamePhase = 'BETWEEN' AND p.LastPlayedHand = @GameHand)
+          );
 
         INSERT @LogSnapshot (LogId, LoggedAt, Message)
         SELECT LogId, LoggedAt, Message
@@ -1942,8 +2020,20 @@ BEGIN
         WHERE DatabaseId = @DatabaseId
           AND HandNumber = @GameHand;
 
+        /* A BETWEEN response contains this hand's final table and transcript.
+           Acknowledge it only after both snapshots have been captured. */
+        IF @GamePhase = 'BETWEEN'
+        BEGIN
+            UPDATE TexasHoldEm_Public.PlayerState
+            SET LastViewedHand = @GameHand
+            WHERE DatabaseId = @DatabaseId
+              AND PlayerId = @PlayerId
+              AND ConnectionId = @ConnectionId
+              AND LastPlayedHand = @GameHand
+              AND LastViewedHand < @GameHand;
+        END;
+
         COMMIT TRANSACTION;
-        SET @TransactionCommitted = 1;
 
         BREAK;
     END;
@@ -2106,9 +2196,6 @@ BEGIN
     BEGIN CATCH
         IF XACT_STATE() <> 0
             ROLLBACK TRANSACTION;
-
-        IF ERROR_NUMBER() = 1222 AND @TransactionCommitted = 1
-            THROW 50010, 'Your action committed, but the refreshed table view timed out. Run STATUS; do not repeat the action.', 1;
 
         IF ERROR_NUMBER() = 1222
             THROW 50008, 'The poker table is busy. Please try again.', 1;

@@ -64,6 +64,12 @@ EXEC dbo.sp_TexasHoldEm_Public @Action = 'STATUS';
 EXEC dbo.sp_TexasHoldEm_Public @Action = 'CALL';
 ```
 
+If a requested display name is already retained by another identity, the call
+continues under a generated `Player <hex>` name and returns an explanatory
+notice instead of failing the whole transaction. After a hand, the table waits
+until every participating human has received the final table and transcript,
+or until the 60-second between-hand deadline expires.
+
 ## Required Azure isolation
 
 A direct SQL login is not a general-purpose sandbox. Even without object
@@ -80,17 +86,19 @@ credentials will be automated against immediately.
 A shared login also cannot prove that four connections represent four people.
 One person can occupy multiple seats, collude with themselves, or reconnect
 under a new connection identity to receive another starting bankroll. An OUT
-row is retained while capacity permits so an idle connection does not
-immediately regain chips, but a shared credential provides no durable human
-identity across reconnections. Use individual Microsoft Entra/database
-identities or put an authenticated application/API in front of SQL when
-one-human-one-seat or one-bankroll-per-human enforcement matters.
+row is retained for up to 60 idle minutes, and while capacity permits, so an
+idle connection does not immediately regain chips. A shared credential still
+provides no durable human identity across reconnections. Use individual
+Microsoft Entra/database identities or put an authenticated application/API in
+front of SQL when one-human-one-seat or one-bankroll-per-human enforcement
+matters.
 
 The game retains at most 64 human identities, including players, spectators,
 and OUT rows. At capacity, a new join evicts the oldest OUT identity first and
 then the stalest spectator; active seats are never evicted. Result sets list
-only the current seats, not accumulated OUT rows. A hostile client can still
-churn that queue or exhaust connection and compute limits; the database
-isolation, monitoring, and kill switch above remain required.
+the current seats and, during BETWEEN, at most the just-completed hand's
+participants—not accumulated OUT rows. A hostile client can still churn that
+queue or exhaust connection and compute limits; the database isolation,
+monitoring, and kill switch above remain required.
 
 The game uses fake QueryBucks and is not designed for money or prizes.
