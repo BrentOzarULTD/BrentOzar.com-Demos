@@ -1359,7 +1359,7 @@ ELSE IF @GState = 'WaitingForPlayers'
                 N' (UTC-ish server time). Run EXEC sp_TexasHoldEm in other sessions to join, then run it again here.'));
 ELSE IF @SeatExists = 1
     INSERT @Prompt (Line) VALUES
-        (CONCAT(N'Hand #', @GHand, N' is done. Run EXEC sp_TexasHoldEm', REPLACE(@NameArg, N', ', N' '), N' to play the next hand.'));
+        (CONCAT(N'Hand #', @GHand, N' is done. Run EXEC sp_TexasHoldEm', STUFF(@NameArg, 1, 2, N' '), N' to play the next hand.'));
 ELSE
     INSERT @Prompt (Line) VALUES
         (N'Run EXEC sp_TexasHoldEm to join the game.');
