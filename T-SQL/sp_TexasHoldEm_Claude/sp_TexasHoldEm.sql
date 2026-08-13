@@ -1012,7 +1012,7 @@ BEGIN
         BEGIN
             /* The robot "brain": mostly calls, sometimes raises, occasionally
                remembers it has feelings and folds. Do not study this for GTO. */
-            SET @r = ABS(CHECKSUM(NEWID())) % 100;
+            SET @r = ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 100;
             IF @Owed <= 0
             BEGIN
                 IF @r < 70 OR @RaiseCount >= @MaxRaises OR @ActorChips < (@NewBet - @ActorBet)
@@ -1066,7 +1066,7 @@ BEGIN
             END
 
             /* Occasional trash talk. The robots contain multitudes. */
-            IF ABS(CHECKSUM(NEWID())) % 100 < 18
+            IF ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 100 < 18
             BEGIN
                 SET @Msg = NULL;
                 SELECT @Msg = CONCAT(@ActorName, N' says: "', q.Quip, N'"')
@@ -1081,7 +1081,7 @@ BEGIN
                     (N'Bender', 2, N'I''m back, baby!'),
                     (N'Bender', 3, N'This game is making me thirsty.')
                 ) q(BotName, QuipId, Quip)
-                WHERE q.BotName = @ActorName AND q.QuipId = 1 + ABS(CHECKSUM(NEWID())) % 3;
+                WHERE q.BotName = @ActorName AND q.QuipId = 1 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 3;
                 IF @Msg IS NOT NULL
                     INSERT ##TexasHoldEm_Log (HandNumber, Message) VALUES (@GHand, @Msg);
             END
