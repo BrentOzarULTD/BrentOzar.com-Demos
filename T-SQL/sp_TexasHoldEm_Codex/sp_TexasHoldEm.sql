@@ -9,6 +9,14 @@ Game state is stored only in global temporary tables. In Azure SQL Database,
 global temporary tables are scoped to the current database. On SQL Server,
 the rows are keyed by database_id so each database has its own game.
 
+The installer also creates a database certificate, but no permanent tables.
+Hole cards are encrypted in transient shared state. Players granted only
+EXECUTE on this procedure see ciphertext if they query the global temporary
+table directly. This is a game-level privacy boundary, not protection from
+sysadmin, db_owner, or principals allowed to alter the procedure or certificate.
+Other shared game-state columns remain directly readable and modifiable, so
+this demonstration is not intended as a security boundary for hostile users.
+
 Quick start (open several SSMS query windows in the same database):
 
     EXEC dbo.sp_TexasHoldEm @PlayerName = N'Brent';
@@ -29,12 +37,15 @@ Other commands:
 
 Simplifications:
   * Four seats, 1,000 starting QueryBucks, and 5/10 blinds.
-  * Raises are at least 10 QueryBucks.
+  * Raises may be any amount at least 10 QueryBucks above the current bet,
+    up to the no-side-pot table maximum. @Amount is the raise-to total.
   * There are no side pots. The maximum street wager is capped at the amount
     the shortest live stack can cover.
   * Robots use a deliberately simple strategy.
   * Turn and one-player-between-hands waits expire after 60 seconds, but an
-    invocation by another session is required to observe and process expiry.
+    invocation is required to observe and process expiry. If the acting player
+    submits an action before another invocation processes the deadline, that
+    action wins the race and is accepted.
   * A timed-out human folds, leaves the table after the hand, and may request
     a seat again by invoking the procedure if they still have QueryBucks.
   * Global temporary state can disappear when its creating session disconnects.
@@ -45,6 +56,18 @@ The procedure returns three result sets:
   3. The public table log for the current hand.
 */
 
+IF CERT_ID(N'sp_TexasHoldEm_CardProtection_Codex') IS NULL
+BEGIN
+    CREATE CERTIFICATE sp_TexasHoldEm_CardProtection_Codex
+        ENCRYPTION BY PASSWORD = 'QueryBucks-Codex-demo-certificate-2026!'
+        WITH SUBJECT = 'Encrypt transient sp_TexasHoldEm hole cards',
+             EXPIRY_DATE = '20991231';
+END;
+GO
+
+DENY CONTROL ON CERTIFICATE::sp_TexasHoldEm_CardProtection_Codex TO public;
+GO
+
 IF OBJECT_ID(N'dbo.sp_TexasHoldEm', N'P') IS NULL
     EXEC(N'CREATE PROCEDURE dbo.sp_TexasHoldEm AS RETURN 0;');
 GO
@@ -53,6 +76,7 @@ ALTER PROCEDURE dbo.sp_TexasHoldEm
     @Action     varchar(20) = NULL,
     @Amount     int = NULL,
     @PlayerName nvarchar(50) = NULL
+WITH EXECUTE AS OWNER
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -164,8 +188,7 @@ BEGIN
                     InHand         bit NOT NULL,
                     Folded         bit NOT NULL,
                     TimedOut       bit NOT NULL,
-                    HoleCard1      tinyint NULL,
-                    HoleCard2      tinyint NULL,
+                    HoleCardsEncrypted varbinary(8000) NULL,
                     StreetBet      int NOT NULL,
                     HandBet        int NOT NULL,
                     ActedThisStreet bit NOT NULL,
@@ -267,6 +290,14 @@ BEGIN
         FROM ##TexasHoldEm_Game_Codex_v1
         WHERE DatabaseId = @DatabaseId;
 
+        IF @InputAction IN ('CHECK', 'CALL', 'BET', 'RAISE', 'FOLD', 'ALLIN')
+           AND @Phase NOT IN ('PREFLOP', 'FLOP', 'TURN', 'RIVER')
+        BEGIN
+            SET @Notice = COALESCE(@Notice + N' ', N'')
+                + N'No betting action was pending; ' + @InputAction + N' was ignored.';
+            SET @ActionConsumed = 1;
+        END;
+
         /* Register this SQL session as a player or spectator. */
         IF NOT EXISTS
         (
@@ -301,7 +332,7 @@ BEGIN
             (
                 DatabaseId, SessionId, PlayerName, Seat, IsRobot, PlayerRole,
                 QueryBucks, WantsSeat, InHand, Folded, TimedOut,
-                HoleCard1, HoleCard2, StreetBet, HandBet, ActedThisStreet,
+                HoleCardsEncrypted, StreetBet, HandBet, ActedThisStreet,
                 ShowCards, HandScore, HandDescription, JoinedAt, LastSeenAt
             )
             VALUES
@@ -310,7 +341,7 @@ BEGIN
                 COALESCE(NULLIF(@PlayerName, N''), N'Session ' + CONVERT(nvarchar(12), @SessionId)),
                 @OpenSeat, 0, CASE WHEN @OpenSeat IS NULL THEN 'SPECTATOR' ELSE 'PLAYER' END,
                 1000, CASE WHEN @OpenSeat IS NULL THEN 1 ELSE 0 END,
-                0, 0, 0, NULL, NULL, 0, 0, 0, 0, NULL, NULL, @Now, @Now
+                0, 0, 0, NULL, 0, 0, 0, 0, NULL, NULL, @Now, @Now
             );
 
             INSERT ##TexasHoldEm_Log_Codex_v1 (DatabaseId, HandNumber, LoggedAt, Message)
@@ -372,14 +403,14 @@ BEGIN
                     (
                         DatabaseId, SessionId, PlayerName, Seat, IsRobot, PlayerRole,
                         QueryBucks, WantsSeat, InHand, Folded, TimedOut,
-                        HoleCard1, HoleCard2, StreetBet, HandBet, ActedThisStreet,
+                        HoleCardsEncrypted, StreetBet, HandBet, ActedThisStreet,
                         ShowCards, HandScore, HandDescription, JoinedAt, LastSeenAt
                     )
                     VALUES
                     (
                         @DatabaseId, -100000 - @RobotSeat,
                         N'QueryBot ' + CONVERT(nvarchar(3), @RobotSeat), @RobotSeat,
-                        1, 'PLAYER', 1000, 0, 0, 0, 0, NULL, NULL,
+                        1, 'PLAYER', 1000, 0, 0, 0, 0, NULL,
                         0, 0, 0, 0, NULL, NULL, @Now, @Now
                     );
 
@@ -581,8 +612,7 @@ BEGIN
             SET InHand = CASE WHEN PlayerRole = 'PLAYER' AND QueryBucks > 0 THEN 1 ELSE 0 END,
                 Folded = 0,
                 TimedOut = 0,
-                HoleCard1 = NULL,
-                HoleCard2 = NULL,
+                HoleCardsEncrypted = NULL,
                 StreetBet = 0,
                 HandBet = 0,
                 ActedThisStreet = 0,
@@ -627,8 +657,11 @@ BEGIN
               AND InHand = 1;
 
             UPDATE p
-            SET HoleCard1 = d1.CardId,
-                HoleCard2 = d2.CardId
+            SET HoleCardsEncrypted = EncryptByCert
+                (
+                    CERT_ID(N'sp_TexasHoldEm_CardProtection_Codex'),
+                    CONVERT(varbinary(1), d1.CardId) + CONVERT(varbinary(1), d2.CardId)
+                )
             FROM ##TexasHoldEm_Players_Codex_v1 AS p
             INNER JOIN #TexasDealOrder AS o ON o.SessionId = p.SessionId
             INNER JOIN #TexasDeck AS d1 ON d1.ShufflePosition = o.DealPosition
@@ -743,6 +776,7 @@ BEGIN
                 @IsRobot bit,
                 @Deadline datetime2(0),
                 @CurrentBet int,
+                @MinimumRaise int,
                 @StreetBet int,
                 @Stack int,
                 @ToCall int,
@@ -759,6 +793,7 @@ BEGIN
                 @ActionSeat = g.ActionSeat,
                 @Deadline = g.ActionDeadline,
                 @CurrentBet = g.CurrentBet,
+                @MinimumRaise = g.MinimumRaise,
                 @Phase = g.Phase
             FROM ##TexasHoldEm_Game_Codex_v1 AS g
             WHERE g.DatabaseId = @DatabaseId;
@@ -769,9 +804,21 @@ BEGIN
                 @IsRobot = p.IsRobot,
                 @StreetBet = p.StreetBet,
                 @Stack = p.QueryBucks,
-                @HoleRank1 = ((p.HoleCard1 - 1) % 13) + 2,
-                @HoleRank2 = ((p.HoleCard2 - 1) % 13) + 2
+                @HoleRank1 = ((CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) % 13) + 2,
+                @HoleRank2 = ((CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) % 13) + 2
             FROM ##TexasHoldEm_Players_Codex_v1 AS p
+            CROSS APPLY
+            (
+                VALUES
+                (
+                    CONVERT(varbinary(2), DecryptByCert
+                    (
+                        CERT_ID(N'sp_TexasHoldEm_CardProtection_Codex'),
+                        p.HoleCardsEncrypted,
+                        N'QueryBucks-Codex-demo-certificate-2026!'
+                    ))
+                )
+            ) AS h(HoleCards)
             WHERE p.DatabaseId = @DatabaseId
               AND p.Seat = @ActionSeat
               AND p.InHand = 1
@@ -803,8 +850,8 @@ BEGIN
                     BEGIN
                         SET @TurnAction = 'RAISE';
                         SET @TargetBet = CASE
-                            WHEN @CurrentBet + 10 > @TableMaximum THEN @TableMaximum
-                            ELSE @CurrentBet + 10
+                            WHEN @CurrentBet + @MinimumRaise > @TableMaximum THEN @TableMaximum
+                            ELSE @CurrentBet + @MinimumRaise
                         END;
                     END
                     ELSE
@@ -815,12 +862,18 @@ BEGIN
                 BEGIN
                     SET @TurnAction = CASE WHEN @CurrentBet = 0 THEN 'BET' ELSE 'RAISE' END;
                     SET @TargetBet = CASE
-                        WHEN @CurrentBet + 10 > @TableMaximum THEN @TableMaximum
-                        ELSE @CurrentBet + 10
+                        WHEN @CurrentBet + @MinimumRaise > @TableMaximum THEN @TableMaximum
+                        ELSE @CurrentBet + @MinimumRaise
                     END;
                 END
                 ELSE
                     SET @TurnAction = 'CHECK';
+            END
+            ELSE IF @ActionSession = @SessionId AND @ActionConsumed = 0 AND @InputAction IS NOT NULL
+            BEGIN
+                SET @TurnAction = @InputAction;
+                SET @TargetBet = @Amount;
+                SET @ActionConsumed = 1;
             END
             ELSE IF @Now >= @Deadline
             BEGIN
@@ -832,17 +885,12 @@ BEGIN
                   AND SessionId = @ActionSession;
                 SET @Notice = COALESCE(@Notice + N' ', N'') + @ActionPlayer + N' timed out and folded.';
             END
-            ELSE IF @ActionSession = @SessionId AND @ActionConsumed = 0 AND @InputAction IS NOT NULL
-            BEGIN
-                SET @TurnAction = @InputAction;
-                SET @TargetBet = @Amount;
-                SET @ActionConsumed = 1;
-            END
             ELSE
             BEGIN
                 IF @ActionConsumed = 0 AND @InputAction IS NOT NULL
                 BEGIN
-                    SET @Notice = N'It is ' + @ActionPlayer + N'''s turn. Your action was not applied.';
+                    SET @Notice = COALESCE(@Notice + N' ', N'')
+                        + N'It is ' + @ActionPlayer + N'''s turn. Your action was not applied.';
                     SET @ActionConsumed = 1;
                 END;
                 BREAK;
@@ -851,38 +899,44 @@ BEGIN
             IF @TurnAction = 'CHECK' AND @ToCall <> 0
             BEGIN
                 SET @Legal = 0;
-                SET @Notice = N'CHECK is not legal when ' + CONVERT(nvarchar(12), @ToCall)
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'CHECK is not legal when ' + CONVERT(nvarchar(12), @ToCall)
                     + N' QueryBucks are needed to call.';
             END
             ELSE IF @TurnAction = 'CALL' AND @ToCall <= 0
             BEGIN
                 SET @Legal = 0;
-                SET @Notice = N'Nothing needs to be called; use CHECK instead.';
+                SET @Notice = COALESCE(@Notice + N' ', N'')
+                    + N'Nothing needs to be called; use CHECK instead.';
             END
             ELSE IF @TurnAction IN ('BET', 'RAISE')
             BEGIN
                 IF @TargetBet IS NULL
                 BEGIN
                     SET @Legal = 0;
-                    SET @Notice = N'BET and RAISE require @Amount. It is the total street wager (raise-to amount).';
+                    SET @Notice = COALESCE(@Notice + N' ', N'')
+                        + N'BET and RAISE require @Amount. It is the total street wager (raise-to amount).';
                 END
                 ELSE IF @TargetBet <= @CurrentBet
                 BEGIN
                     SET @Legal = 0;
-                    SET @Notice = N'The target must be greater than the current bet of '
+                    SET @Notice = COALESCE(@Notice + N' ', N'')
+                        + N'The target must be greater than the current bet of '
                         + CONVERT(nvarchar(12), @CurrentBet) + N'.';
                 END
                 ELSE IF @TargetBet > @TableMaximum
                 BEGIN
                     SET @Legal = 0;
-                    SET @Notice = N'The no-side-pot table maximum is '
+                    SET @Notice = COALESCE(@Notice + N' ', N'')
+                        + N'The no-side-pot table maximum is '
                         + CONVERT(nvarchar(12), @TableMaximum) + N' QueryBucks this street.';
                 END
-                ELSE IF @TargetBet < @CurrentBet + 10 AND @TargetBet <> @TableMaximum
+                ELSE IF @TargetBet < @CurrentBet + @MinimumRaise AND @TargetBet <> @TableMaximum
                 BEGIN
                     SET @Legal = 0;
-                    SET @Notice = N'The minimum raise-to amount is '
-                        + CONVERT(nvarchar(12), @CurrentBet + 10)
+                    SET @Notice = COALESCE(@Notice + N' ', N'')
+                        + N'The minimum raise-to amount is '
+                        + CONVERT(nvarchar(12), @CurrentBet + @MinimumRaise)
                         + N', unless moving to the table maximum.';
                 END;
             END;
@@ -1005,6 +1059,8 @@ BEGIN
                     ActionSeat = NULL,
                     ActionDeadline = NULL,
                     LobbyClosesAt = DATEADD(second, 60, @Now),
+                    CurrentBet = 0,
+                    Pot = 0,
                     LastChangedAt = @Now
                 WHERE DatabaseId = @DatabaseId;
 
@@ -1052,7 +1108,20 @@ BEGIN
                     CROSS APPLY
                     (
                         VALUES
-                            (1, p.HoleCard1), (2, p.HoleCard2),
+                        (
+                            CONVERT(varbinary(2), DecryptByCert
+                            (
+                                CERT_ID(N'sp_TexasHoldEm_CardProtection_Codex'),
+                                p.HoleCardsEncrypted,
+                                N'QueryBucks-Codex-demo-certificate-2026!'
+                            ))
+                        )
+                    ) AS h(HoleCards)
+                    CROSS APPLY
+                    (
+                        VALUES
+                            (1, CONVERT(tinyint, SUBSTRING(h.HoleCards, 1, 1))),
+                            (2, CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1))),
                             (3, g.Board1), (4, g.Board2), (5, g.Board3),
                             (6, g.Board4), (7, g.Board5)
                     ) AS v(Position, CardId)
@@ -1142,16 +1211,16 @@ BEGIN
                             CASE WHEN s.DistinctRanks = 5 AND s.MinimumRank = 2
                                       AND s.MaximumRank = 14 AND s.RankSum = 28
                                  THEN 5 ELSE s.MaximumRank END AS StraightHigh,
-                            MAX(CASE WHEN r.GroupOrder = 1 THEN r.RankValue END) AS G1,
-                            MAX(CASE WHEN r.GroupOrder = 2 THEN r.RankValue END) AS G2,
-                            MAX(CASE WHEN r.GroupOrder = 3 THEN r.RankValue END) AS G3,
-                            MAX(CASE WHEN r.GroupOrder = 4 THEN r.RankValue END) AS G4,
-                            MAX(CASE WHEN r.GroupOrder = 5 THEN r.RankValue END) AS G5,
-                            MAX(CASE WHEN r.RankOrder = 1 THEN r.RankValue END) AS H1,
-                            MAX(CASE WHEN r.RankOrder = 2 THEN r.RankValue END) AS H2,
-                            MAX(CASE WHEN r.RankOrder = 3 THEN r.RankValue END) AS H3,
-                            MAX(CASE WHEN r.RankOrder = 4 THEN r.RankValue END) AS H4,
-                            MAX(CASE WHEN r.RankOrder = 5 THEN r.RankValue END) AS H5
+                            MAX(CASE WHEN r.GroupOrder = 1 THEN r.RankValue ELSE 0 END) AS G1,
+                            MAX(CASE WHEN r.GroupOrder = 2 THEN r.RankValue ELSE 0 END) AS G2,
+                            MAX(CASE WHEN r.GroupOrder = 3 THEN r.RankValue ELSE 0 END) AS G3,
+                            MAX(CASE WHEN r.GroupOrder = 4 THEN r.RankValue ELSE 0 END) AS G4,
+                            MAX(CASE WHEN r.GroupOrder = 5 THEN r.RankValue ELSE 0 END) AS G5,
+                            MAX(CASE WHEN r.RankOrder = 1 THEN r.RankValue ELSE 0 END) AS H1,
+                            MAX(CASE WHEN r.RankOrder = 2 THEN r.RankValue ELSE 0 END) AS H2,
+                            MAX(CASE WHEN r.RankOrder = 3 THEN r.RankValue ELSE 0 END) AS H3,
+                            MAX(CASE WHEN r.RankOrder = 4 THEN r.RankValue ELSE 0 END) AS H4,
+                            MAX(CASE WHEN r.RankOrder = 5 THEN r.RankValue ELSE 0 END) AS H5
                         FROM #ComboStats AS s
                         INNER JOIN #RankGroups AS r
                             ON r.SessionId = s.SessionId AND r.ComboId = s.ComboId
@@ -1239,20 +1308,27 @@ BEGIN
                     WHERE p.DatabaseId = @DatabaseId
                       AND s.Score = @WinningScore;
 
-                    SELECT @WinnerNames = @WinnerNames
-                        + CASE WHEN @WinnerNames = N'' THEN N'' ELSE N', ' END
-                        + p.PlayerName
-                    FROM ##TexasHoldEm_Players_Codex_v1 AS p
-                    INNER JOIN #PlayerScores AS s ON s.SessionId = p.SessionId
-                    WHERE p.DatabaseId = @DatabaseId
-                      AND s.Score = @WinningScore
-                    ORDER BY p.Seat;
+                    SELECT @WinnerNames = STUFF
+                    (
+                        (
+                            SELECT N', ' + p.PlayerName
+                            FROM ##TexasHoldEm_Players_Codex_v1 AS p
+                            INNER JOIN #PlayerScores AS s ON s.SessionId = p.SessionId
+                            WHERE p.DatabaseId = @DatabaseId
+                              AND s.Score = @WinningScore
+                            ORDER BY p.Seat
+                            FOR XML PATH(''), TYPE
+                        ).value('.', 'nvarchar(1000)'),
+                        1, 2, N''
+                    );
 
                     UPDATE ##TexasHoldEm_Game_Codex_v1
                     SET Phase = 'BETWEEN',
                         ActionSeat = NULL,
                         ActionDeadline = NULL,
                         LobbyClosesAt = DATEADD(second, 60, @Now),
+                        CurrentBet = 0,
+                        Pot = 0,
                         BoardCardsVisible = 5,
                         LastChangedAt = @Now
                     WHERE DatabaseId = @DatabaseId;
@@ -1336,6 +1412,14 @@ BEGIN
             WHERE DatabaseId = @DatabaseId;
         END;
 
+        IF @InputAction IN ('CHECK', 'CALL', 'BET', 'RAISE', 'FOLD', 'ALLIN')
+           AND @ActionConsumed = 0
+        BEGIN
+            SET @Notice = COALESCE(@Notice + N' ', N'')
+                + N'No betting action was pending; ' + @InputAction + N' was ignored.';
+            SET @ActionConsumed = 1;
+        END;
+
         COMMIT TRANSACTION;
 
         IF @KeepWaiting = 1
@@ -1358,6 +1442,7 @@ BEGIN
         @GameHand int,
         @GamePot int,
         @GameBet int,
+        @GameMinimumRaise int,
         @GameActionSeat tinyint,
         @GameDeadline datetime2(0),
         @GameLobbyEnd datetime2(0),
@@ -1370,6 +1455,7 @@ BEGIN
         @ViewerStack int,
         @ViewerToCall int,
         @OutputMaximum int,
+        @DisplayedMinimumRaiseTo int,
         @SecondsRemaining int;
 
     SELECT
@@ -1387,6 +1473,7 @@ BEGIN
         @GameHand = HandNumber,
         @GamePot = Pot,
         @GameBet = CurrentBet,
+        @GameMinimumRaise = MinimumRaise,
         @GameActionSeat = ActionSeat,
         @GameDeadline = ActionDeadline,
         @GameLobbyEnd = LobbyClosesAt,
@@ -1403,6 +1490,12 @@ BEGIN
     WHERE DatabaseId = @DatabaseId
       AND InHand = 1
       AND Folded = 0;
+
+    SET @DisplayedMinimumRaiseTo = CASE
+        WHEN @OutputMaximum <= @GameBet THEN NULL
+        WHEN @GameBet + @GameMinimumRaise > @OutputMaximum THEN @OutputMaximum
+        ELSE @GameBet + @GameMinimumRaise
+    END;
 
     SET @SecondsRemaining = CASE
         WHEN @GamePhase = 'LOBBY' THEN DATEDIFF(second, SYSUTCDATETIME(), @GameLobbyEnd)
@@ -1436,11 +1529,23 @@ BEGIN
     BEGIN
         SET @Prompt = N'It is your turn.';
         SET @LegalActions = CASE WHEN @ViewerToCall = 0
-            THEN N'CHECK; BET/RAISE to at least 10 (maximum '
-                 + CONVERT(nvarchar(12), @OutputMaximum) + N'); FOLD; ALLIN.'
+            THEN N'CHECK'
+                 + CASE WHEN @DisplayedMinimumRaiseTo IS NULL THEN N''
+                        WHEN @GameBet = 0 THEN N'; BET to at least '
+                            + CONVERT(nvarchar(12), @DisplayedMinimumRaiseTo)
+                            + N' (maximum ' + CONVERT(nvarchar(12), @OutputMaximum) + N'); ALLIN'
+                        ELSE N'; RAISE to at least '
+                            + CONVERT(nvarchar(12), @DisplayedMinimumRaiseTo)
+                            + N' (maximum ' + CONVERT(nvarchar(12), @OutputMaximum) + N'); ALLIN'
+                   END
+                 + N'; FOLD.'
             ELSE N'CALL ' + CONVERT(nvarchar(12), @ViewerToCall)
-                 + N'; RAISE to at least ' + CONVERT(nvarchar(12), @GameBet + 10)
-                 + N' (maximum ' + CONVERT(nvarchar(12), @OutputMaximum) + N'); FOLD; ALLIN.'
+                 + CASE WHEN @DisplayedMinimumRaiseTo IS NULL THEN N''
+                        ELSE N'; RAISE to at least '
+                            + CONVERT(nvarchar(12), @DisplayedMinimumRaiseTo)
+                            + N' (maximum ' + CONVERT(nvarchar(12), @OutputMaximum) + N'); ALLIN'
+                   END
+                 + N'; FOLD.'
         END;
         SET @Example = CASE WHEN @ViewerToCall = 0
             THEN N'EXEC dbo.sp_TexasHoldEm @Action = ''CHECK'';'
@@ -1489,17 +1594,20 @@ BEGIN
         END AS PlayerStatus,
         p.StreetBet AS BetThisStreet,
         p.HandBet AS InThePot,
-        CASE WHEN p.SessionId = @SessionId OR p.ShowCards = 1
+        CASE WHEN p.HoleCardsEncrypted IS NULL THEN N'(none)'
+            WHEN p.SessionId = @SessionId OR p.ShowCards = 1
             THEN
-                CASE ((p.HoleCard1 - 1) % 13) + 2
+                CASE ((CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) % 13) + 2
                     WHEN 14 THEN 'A' WHEN 13 THEN 'K' WHEN 12 THEN 'Q' WHEN 11 THEN 'J' WHEN 10 THEN 'T'
-                    ELSE CONVERT(varchar(2), ((p.HoleCard1 - 1) % 13) + 2) END
-                + CASE (p.HoleCard1 - 1) / 13 WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
+                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) % 13) + 2) END
+                + CASE (CONVERT(int, SUBSTRING(h.HoleCards, 1, 1)) - 1) / 13
+                    WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
                 + N' '
-                + CASE ((p.HoleCard2 - 1) % 13) + 2
+                + CASE ((CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) % 13) + 2
                     WHEN 14 THEN 'A' WHEN 13 THEN 'K' WHEN 12 THEN 'Q' WHEN 11 THEN 'J' WHEN 10 THEN 'T'
-                    ELSE CONVERT(varchar(2), ((p.HoleCard2 - 1) % 13) + 2) END
-                + CASE (p.HoleCard2 - 1) / 13 WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
+                    ELSE CONVERT(varchar(2), ((CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) % 13) + 2) END
+                + CASE (CONVERT(int, SUBSTRING(h.HoleCards, 2, 1)) - 1) / 13
+                    WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END
             ELSE N'Hidden'
         END AS HoleCards,
         CASE WHEN p.ShowCards = 1 THEN p.HandDescription ELSE NULL END AS ShowdownHand,
@@ -1527,6 +1635,18 @@ BEGIN
                     + CASE (@Board5 - 1) / 13 WHEN 0 THEN N'♣' WHEN 1 THEN N'♦' WHEN 2 THEN N'♥' ELSE N'♠' END ELSE N'' END
         END AS CommunityCards
     FROM ##TexasHoldEm_Players_Codex_v1 AS p
+    CROSS APPLY
+    (
+        VALUES
+        (
+            CONVERT(varbinary(2), DecryptByCert
+            (
+                CERT_ID(N'sp_TexasHoldEm_CardProtection_Codex'),
+                p.HoleCardsEncrypted,
+                N'QueryBucks-Codex-demo-certificate-2026!'
+            ))
+        )
+    ) AS h(HoleCards)
     WHERE p.DatabaseId = @DatabaseId
       AND p.PlayerRole IN ('PLAYER', 'OUT')
     ORDER BY CASE WHEN p.Seat IS NULL THEN 1 ELSE 0 END, p.Seat, p.JoinedAt;
