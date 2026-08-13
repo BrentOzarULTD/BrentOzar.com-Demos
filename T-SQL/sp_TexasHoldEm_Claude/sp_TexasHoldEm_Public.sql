@@ -88,6 +88,15 @@ HOW TO PLAY
         EXEC sp_TexasHoldEm_Public @Action = 'Fold',  @PlayerName = 'Brent';
      After a hand ends, run EXEC sp_TexasHoldEm_Public again to keep playing.
 
+  4. Every call hands back four result sets, in this order: Hand (the table
+     at a glance), Seat (who's sitting where), What Now (the exact commands
+     to run next), and What Happened (the play-by-play). By default, What
+     Happened only covers this turn - the action since you last ran a
+     query. To see more, pass @ShowWhatHappened:
+        'ThisTurn'   - the default: just what you missed since last time.
+        'ThisGame'   - every hand of the game currently being played.
+        'AllHistory' - the whole log, all the way back. Bring popcorn.
+
 Actions: Join (default), Check, Call, Bet, Raise, Fold, Leave, Watch,
          Status (instant snapshot, never blocks), Help.
 
@@ -188,7 +197,10 @@ GO
 CREATE OR ALTER PROCEDURE dbo.sp_TexasHoldEm_Public
     @Action nvarchar(20) = NULL,
     @PlayerName nvarchar(30) = NULL,
-    @SeatPassword nvarchar(50) = NULL
+    @SeatPassword nvarchar(50) = NULL,
+    /* How much of the play-by-play to show in the What Happened result set:
+       ThisTurn (default), ThisGame, or AllHistory. */
+    @ShowWhatHappened nvarchar(20) = N'ThisTurn'
 AS
 BEGIN
 SET NOCOUNT ON;
@@ -235,6 +247,10 @@ DECLARE @rc int,
         @TargetHand int = 0,
         @WaitStart datetime2 = SYSDATETIME(),
         @LastLogId int = 0,
+        /* Where "this turn" starts in the log: whatever was already on the
+           board when this call picked the game up. */
+        @TurnStartLogId int = 0,
+        @GameStartLogId int = 0,
         @CardsShownForHand int = -1,
         /* game snapshot */
         @GState varchar(20), @GHand int, @Dealer tinyint, @SBSeat tinyint, @BBSeat tinyint,
@@ -271,6 +287,7 @@ DECLARE @RanksT TABLE (CardRank int);
 DECLARE @FRanks TABLE (CardRank int);
 DECLARE @ShowResults TABLE (SeatNum tinyint, PlayerName nvarchar(30), Score bigint, HandName nvarchar(60));
 DECLARE @Prompt TABLE (LineId int IDENTITY(1,1), Line nvarchar(300));
+DECLARE @Happened TABLE (LogId int, Message nvarchar(500));
 
 /* A deck of cards. CardId 0-51: rank = CardId / 4 + 2 (2..14), suit = CardId % 4. */
 CREATE TABLE #Poker_Cards (CardId tinyint PRIMARY KEY, CardRank int, CardSuit tinyint, Display nvarchar(3));
@@ -291,7 +308,24 @@ INSERT #Poker_RankNames (RankValue, RankName, RankPlural) VALUES
 SET @Action = NULLIF(LTRIM(RTRIM(@Action)), N'');
 SET @PlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
 SET @SeatPassword = NULLIF(@SeatPassword, N'');
+SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
 IF @Action = N'Join' SET @Action = NULL;
+
+/* Explicit CI collation so this behaves the same on a case-sensitive
+   database - the value picks a code path, so it can't drift with collation. */
+IF @ShowWhatHappened COLLATE Latin1_General_100_CI_AS
+   NOT IN (N'ThisTurn', N'ThisGame', N'AllHistory')
+BEGIN
+    SELECT [Say What?] = CONCAT(N'I don''t know the @ShowWhatHappened option ''', @ShowWhatHappened,
+        N'''. Try: ThisTurn (the default), ThisGame, or AllHistory.');
+    RETURN;
+END
+/* Snap it to canonical casing so the checks further down don't have to keep
+   spelling out the collation. */
+SET @ShowWhatHappened = CASE
+    WHEN @ShowWhatHappened COLLATE Latin1_General_100_CI_AS = N'ThisGame' THEN N'ThisGame'
+    WHEN @ShowWhatHappened COLLATE Latin1_General_100_CI_AS = N'AllHistory' THEN N'AllHistory'
+    ELSE N'ThisTurn' END;
 
 IF @Action IS NOT NULL
    AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
@@ -316,7 +350,10 @@ BEGIN
         (9, N'EXEC sp_TexasHoldEm_Public @Action = ''Status'';                             -- instant snapshot, never blocks'),
         (10,N'From your original session, actions just work. From a NEW session, add your @SeatPassword.'),
         (11,N'While your query runs, watch the Messages tab - the action streams in live.'),
-        (12,N'The query finishes when it''s your turn, and tells you exactly what to run next.')
+        (12,N'The query finishes when it''s your turn, and tells you exactly what to run next.'),
+        (13,N'Results come back as: Hand, Seat, What Now, What Happened.'),
+        (14,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
+        (15,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for every hand ever played here.')
         ) v(LineId, Line)
     ORDER BY v.LineId;
     RETURN;
@@ -420,6 +457,11 @@ BEGIN
 
         SET @LastLogId = ISNULL((SELECT MAX(LogId) FROM dbo.TexasHoldEm_Log), 0) - 12;
         IF @LastLogId < 0 SET @LastLogId = 0;
+        /* Where "this turn" starts, deliberately including the same short
+           backlog the streaming loop replays: what the What Happened result
+           set shows should match what scrolled past in the Messages tab,
+           not diverge from it. */
+        SET @TurnStartLogId = @LastLogId;
 
         /* On a public server, tables get abandoned mid-hand. If nothing has
            happened for a while, sweep the chips and reset rather than making
@@ -1372,8 +1414,10 @@ BEGIN
 END /* main wait loop */
 
 /* ================================================================
-   Show this session everything: the table, the players, the action,
-   and exactly what to run next.
+   Show this session everything: the table, the players, exactly what to
+   run next, and then the action. What Now comes before What Happened on
+   purpose - the play-by-play can run long, and nobody should have to
+   scroll past it to find out what to type.
    ================================================================ */
 IF @GameGone = 1 OR NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Game)
 BEGIN
@@ -1450,12 +1494,7 @@ SELECT [Seat] = p.SeatNum,
 FROM dbo.TexasHoldEm_Players p
 ORDER BY p.SeatNum;
 
-/* Result 3: the recent action. */
-SELECT [What Happened] = x.Message
-FROM (SELECT TOP (25) LogId, Message FROM dbo.TexasHoldEm_Log ORDER BY LogId DESC) x
-ORDER BY x.LogId;
-
-/* Result 4: what to do now. Never echo @SeatPassword back - results get
+/* Result 3: what to do now. Never echo @SeatPassword back - results get
    screenshotted, projected, and streamed. */
 SET @NameArg = CASE WHEN @PlayerName IS NOT NULL
                     THEN CONCAT(N', @PlayerName = ''', REPLACE(@PlayerName, N'''', N''''''), N'''')
@@ -1529,6 +1568,46 @@ ELSE
         (N'Run EXEC sp_TexasHoldEm_Public to join the game.');
 
 SELECT [What Now] = Line FROM @Prompt ORDER BY LineId;
+
+/* Result 4: the play-by-play. ThisTurn - the default - is the action since
+   you last ran a query, because that's the part you missed. It's bounded on
+   BOTH ends on purpose: @TurnStartLogId is where this call started reading
+   (including the short backlog the proc streams for context), and
+   @LastLogId is the last line this call actually streamed. Without the
+   upper bound, a busy table could write new lines between the final COMMIT
+   and this query, and the grid would show action the Messages tab never
+   did. The log outlives games, so ThisGame has to find where the current
+   one started: a new game resets HandNumber to 0, so the boundary is the
+   last place the hand number went backwards. No string matching on log
+   messages - those are prose, and prose gets edited. */
+DELETE @Happened;
+
+IF @ShowWhatHappened = N'ThisTurn'
+    INSERT @Happened (LogId, Message)
+    SELECT LogId, Message FROM dbo.TexasHoldEm_Log
+     WHERE LogId > @TurnStartLogId AND LogId <= @LastLogId;
+ELSE IF @ShowWhatHappened = N'ThisGame'
+BEGIN
+    SELECT @GameStartLogId = ISNULL(MAX(x.LogId), 0)
+    FROM (SELECT LogId, HandNumber,
+                 PrevHand = LAG(HandNumber) OVER (ORDER BY LogId)
+          FROM dbo.TexasHoldEm_Log) x
+    WHERE x.PrevHand IS NOT NULL AND x.HandNumber < x.PrevHand;
+
+    INSERT @Happened (LogId, Message)
+    SELECT LogId, Message FROM dbo.TexasHoldEm_Log WHERE LogId >= @GameStartLogId;
+END
+ELSE
+    INSERT @Happened (LogId, Message)
+    SELECT LogId, Message FROM dbo.TexasHoldEm_Log;
+
+IF NOT EXISTS (SELECT 1 FROM @Happened)
+    INSERT @Happened (LogId, Message)
+    VALUES (0, CASE WHEN @ShowWhatHappened = N'ThisTurn'
+                    THEN N'Nothing to replay for this turn. Pass @ShowWhatHappened = ''ThisGame'' or ''AllHistory'' to see more.'
+                    ELSE N'Nothing in the log yet. Nobody has played a hand here.' END);
+
+SELECT [What Happened] = Message FROM @Happened ORDER BY LogId;
 
 END TRY
 BEGIN CATCH
