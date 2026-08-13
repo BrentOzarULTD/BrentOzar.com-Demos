@@ -457,8 +457,10 @@ BEGIN
 
         SET @LastLogId = ISNULL((SELECT MAX(LogId) FROM dbo.TexasHoldEm_Log), 0) - 12;
         IF @LastLogId < 0 SET @LastLogId = 0;
-        /* Everything from here on is "this turn": it's exactly what streams
-           into this session's Messages tab before the query returns. */
+        /* Where "this turn" starts, deliberately including the same short
+           backlog the streaming loop replays: what the What Happened result
+           set shows should match what scrolled past in the Messages tab,
+           not diverge from it. */
         SET @TurnStartLogId = @LastLogId;
 
         /* On a public server, tables get abandoned mid-hand. If nothing has
@@ -1567,17 +1569,23 @@ ELSE
 
 SELECT [What Now] = Line FROM @Prompt ORDER BY LineId;
 
-/* Result 4: the play-by-play. ThisTurn - the default - is just the action
-   since you last ran a query, because that's the part you missed. The log
-   outlives games, so ThisGame has to find where the current one started:
-   a new game resets HandNumber to 0, so the boundary is the last place the
-   hand number went backwards. No string matching on log messages - those
-   are prose, and prose gets edited. */
+/* Result 4: the play-by-play. ThisTurn - the default - is the action since
+   you last ran a query, because that's the part you missed. It's bounded on
+   BOTH ends on purpose: @TurnStartLogId is where this call started reading
+   (including the short backlog the proc streams for context), and
+   @LastLogId is the last line this call actually streamed. Without the
+   upper bound, a busy table could write new lines between the final COMMIT
+   and this query, and the grid would show action the Messages tab never
+   did. The log outlives games, so ThisGame has to find where the current
+   one started: a new game resets HandNumber to 0, so the boundary is the
+   last place the hand number went backwards. No string matching on log
+   messages - those are prose, and prose gets edited. */
 DELETE @Happened;
 
 IF @ShowWhatHappened = N'ThisTurn'
     INSERT @Happened (LogId, Message)
-    SELECT LogId, Message FROM dbo.TexasHoldEm_Log WHERE LogId > @TurnStartLogId;
+    SELECT LogId, Message FROM dbo.TexasHoldEm_Log
+     WHERE LogId > @TurnStartLogId AND LogId <= @LastLogId;
 ELSE IF @ShowWhatHappened = N'ThisGame'
 BEGIN
     SELECT @GameStartLogId = ISNULL(MAX(x.LogId), 0)
@@ -1596,7 +1604,7 @@ ELSE
 IF NOT EXISTS (SELECT 1 FROM @Happened)
     INSERT @Happened (LogId, Message)
     VALUES (0, CASE WHEN @ShowWhatHappened = N'ThisTurn'
-                    THEN N'Nothing happened since your last query. Pass @ShowWhatHappened = ''ThisGame'' or ''AllHistory'' to see more.'
+                    THEN N'Nothing to replay for this turn. Pass @ShowWhatHappened = ''ThisGame'' or ''AllHistory'' to see more.'
                     ELSE N'Nothing in the log yet. Nobody has played a hand here.' END);
 
 SELECT [What Happened] = Message FROM @Happened ORDER BY LogId;
