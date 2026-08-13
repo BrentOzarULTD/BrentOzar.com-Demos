@@ -386,6 +386,13 @@ BEGIN
                 INSERT ##TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
                 VALUES (@MySeat, @PlayerName, @@SPID, 0, @StartingChips);
 
+                /* If the waiting table had emptied out, this player is opening
+                   a fresh lobby and should get the full join window. */
+                IF (SELECT COUNT(*) FROM ##TexasHoldEm_Players) = 1
+                   AND (SELECT GameState FROM ##TexasHoldEm_Game) = 'WaitingForPlayers'
+                    UPDATE ##TexasHoldEm_Game
+                       SET JoinWindowEndsAt = DATEADD(second, @JoinWindowSeconds, SYSDATETIME());
+
                 INSERT ##TexasHoldEm_Log (HandNumber, Message)
                 SELECT HandNumber,
                        CASE WHEN GameState = 'WaitingForPlayers'
