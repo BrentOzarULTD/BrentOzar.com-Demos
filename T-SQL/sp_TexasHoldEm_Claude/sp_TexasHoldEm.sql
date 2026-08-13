@@ -222,6 +222,12 @@ BEGIN
 
             /* COLLATE DATABASE_DEFAULT keeps string comparisons working when
                the user database's collation differs from tempdb's. */
+            /* Bootstrap race: two first-callers in DIFFERENT databases hold
+               different applocks, so the CREATE itself is the tiebreaker -
+               the loser hits error 2714 and gets the wrong-database refusal
+               below instead of an ugly object-already-exists error. */
+            BEGIN TRY
+
             CREATE TABLE ##TexasHoldEm_Game (
                 GameState varchar(20) COLLATE DATABASE_DEFAULT NOT NULL,
                 HandNumber int NOT NULL,
@@ -273,6 +279,26 @@ BEGIN
             INSERT ##TexasHoldEm_Log (HandNumber, Message)
             VALUES (0, CONCAT(N'A new Texas Hold ''Em game is starting! Waiting up to ', @JoinWindowSeconds,
                     N' seconds for players. Run EXEC sp_TexasHoldEm in other sessions to join.'));
+
+            END TRY
+            BEGIN CATCH
+                IF ERROR_NUMBER() <> 2714 THROW;   /* only "object already exists" means we lost the race */
+                IF @@TRANCOUNT > 0 ROLLBACK;       /* undo our half of the bootstrap, release our applock */
+
+                /* Same-database racers are serialized by our applock, so the
+                   winner is (almost) always another database. This read waits
+                   for the winner's create/insert transaction to commit. */
+                SET @OwnerDb = NULL;
+                IF OBJECT_ID('tempdb..##TexasHoldEm_Game') IS NOT NULL
+                    SELECT @OwnerDb = CreatedInDatabase FROM ##TexasHoldEm_Game;
+
+                IF @OwnerDb IS NULL OR @OwnerDb = DB_NAME()
+                    SELECT [Try Again] = N'Another session was starting a game at the same instant. Run EXEC sp_TexasHoldEm again to join it.';
+                ELSE
+                    SELECT [Wrong Database] = CONCAT(N'There''s already a game running from the [', @OwnerDb,
+                        N'] database on this instance, and one table is all this casino''s got. Connect to that database to play.');
+                RETURN;
+            END CATCH
         END
         ELSE
         BEGIN
