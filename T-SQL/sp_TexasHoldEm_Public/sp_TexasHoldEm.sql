@@ -1197,7 +1197,7 @@ BEGIN
             IF @LoopGuard > 200
             BEGIN
                 ROLLBACK TRANSACTION;
-                THROW 50004, 'The poker action loop exceeded its safety limit.', 1;
+                THROW 50011, 'The poker action loop exceeded its safety limit.', 1;
             END;
 
             DECLARE
@@ -2118,6 +2118,8 @@ BEGIN
 END;
 GO
 
+/* ALTER PROCEDURE removes existing module signatures, so every successful
+   installer run must add this signature again after the ALTER. */
 ADD SIGNATURE TO OBJECT::dbo.sp_TexasHoldEm_Public
     BY CERTIFICATE sp_TexasHoldEm_CardProtection_Public
     WITH PASSWORD = 'THeP!9xQ#4mZ@7vK$2sN_2026';
