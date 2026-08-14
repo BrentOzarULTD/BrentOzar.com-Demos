@@ -408,15 +408,17 @@ END
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
    impersonate other players with, no consecutive spaces to fake a lookalike. */
-/* The literal chars go BEFORE the A-Za-z0-9 ranges in this bracket list on
-   purpose: under a binary collation, SQL Server's LIKE silently drops a
-   trailing literal underscore/dash from a character class when it comes
-   after adjacent A-Z/a-z/0-9 ranges (reproduced directly against the
-   engine), which rejected every legitimate name containing either
-   character. Leading with the literals sidesteps the engine bug - it's not
-   just cosmetic reordering. */
+/* Every literal in this bracket list - including the dash - comes BEFORE
+   the A-Za-z0-9 ranges on purpose: under a binary collation, SQL Server's
+   LIKE silently drops a trailing literal underscore/dash from a character
+   class when it comes after adjacent A-Z/a-z/0-9 ranges (reproduced
+   directly against the engine), which rejected every legitimate name
+   containing either character. A leading dash is unambiguously literal per
+   standard bracket-list rules, so putting it first (not just "not last")
+   closes the gap for good instead of relying on the same trailing position
+   that caused the bug. */
 IF @PlayerName IS NOT NULL
-   AND (@PlayerName LIKE N'%[^_ .A-Za-z0-9-]%' COLLATE Latin1_General_100_BIN2
+   AND (@PlayerName LIKE N'%[^-_ .A-Za-z0-9]%' COLLATE Latin1_General_100_BIN2
         OR @PlayerName LIKE N'%  %')
 BEGIN
     SELECT [Say What?] = N'Player names here are boring on purpose: up to 30 characters of letters, numbers, single spaces, dots, dashes, and underscores. No emoji, no zero-width shenanigans, no pretending to be somebody else.';
@@ -454,8 +456,11 @@ BEGIN TRY
        caller a phantom empty result set - the documented contract is
        exactly four result sets (Hand, Seat, What Now, What Happened) every
        call, and a stray fifth one would break any client that reads them
-       by position. */
-    EXEC sp_executesql N'SELECT @ProbeDummy = 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist;',
+       by position. TOP (1) stops after the first row instead of enumerating
+       the full (unfiltered, four-way) cross join - existence/permission
+       checks happen at compile time regardless of how many rows actually
+       match, so the early-out doesn't weaken the probe. */
+    EXEC sp_executesql N'SELECT TOP (1) @ProbeDummy = 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist;',
         N'@ProbeDummy int OUTPUT', @ProbeDummy OUTPUT;
 END TRY
 BEGIN CATCH
@@ -1168,9 +1173,19 @@ BEGIN
                 SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
                 FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
                 WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)),
+            /* Rank only the bot names NOT already seated. Ranking all three
+               unconditionally (Clippy=1st free seat, HAL=2nd, Bender=3rd)
+               throws a PlayerName UNIQUE-constraint violation - and aborts
+               the whole call for every player at the table - the moment
+               robots empty out one at a time instead of all at once, since
+               a survivor's name (e.g. Clippy still seated) collides with
+               the newcomer the fixed ranking tries to assign to the same
+               name. That's the common case, not a rare one: robots don't
+               all bust in the same hand. */
             bots AS (
                 SELECT b.BotName, rn = ROW_NUMBER() OVER (ORDER BY b.SortOrder)
-                FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName))
+                FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName)
+                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.PlayerName = b.BotName))
             INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
             SELECT f.SeatNum, b.BotName, 0, 1, @StartingChips
             FROM freeseats f JOIN bots b ON b.rn = f.rn;
