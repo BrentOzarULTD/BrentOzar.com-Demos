@@ -443,7 +443,7 @@ BEGIN
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @RaiseCount >= @MaxRaises
                 BEGIN
-                    SET @Notice = N'Betting''s capped this round - you can Call or Fold.';
+                    SET @Notice = N'Betting''s capped this round - you can Call, go AllIn, or Fold.';
                     SET @ReturnNow = 1;
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @MyChips < (@NewBet - @MyBet)
@@ -500,8 +500,11 @@ BEGIN
                             UPDATE ##TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
                         END
                         INSERT ##TexasHoldEm_Log (HandNumber, Message)
-                        VALUES (@GHand, CASE WHEN @AllInTo > @BetToCall
-                                THEN CONCAT(@PlayerName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                        VALUES (@GHand, CASE
+                                WHEN @AllInTo > @BetToCall
+                                    THEN CONCAT(@PlayerName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                                WHEN @AllInTo = @BetToCall
+                                    THEN CONCAT(@PlayerName, N' calls ALL IN for ', @Pay, N'.')
                                 ELSE CONCAT(@PlayerName, N' calls ALL IN for ', @Pay,
                                             N', which doesn''t cover the ', @BetToCall, N'.') END);
                     END
@@ -1093,11 +1096,17 @@ BEGIN
             /* Fixed-limit table: a raise needs an open raise slot and the chips to make it. */
             SET @CanRaise = CASE WHEN @RaiseCount < @MaxRaises AND @ActorChips >= (@NewBet - @ActorBet)
                                  THEN 1 ELSE 0 END;
-            /* Two reasons a robot stops pretending and shoves: a monster in the hole,
-               or a stack so short that one more fixed-limit bet would eat it anyway. */
+            /* Shoving is only for short stacks. This is a LIMIT table with 50 big
+               bets in front of everyone at the start, so a robot that jams its whole
+               stack on hand one just ends the game - which is exactly what the first
+               test run did. A stack only goes in when the fixed-limit bets can't get
+               it in anyway: desperation under two bets, or a monster under five.
+               @r is 0-99, so "@r < 45" is a 45% chance. */
             SET @Shove = CASE WHEN @ActorChips > 0
-                               AND ((@ActorRank1 = @ActorRank2 AND @ActorRank1 >= 12 AND @r >= 60)
-                                    OR (@ActorChips <= 2 * @Unit AND @r >= 55))
+                               AND ((@ActorChips <= 2 * @Unit AND @r < 45)
+                                    OR (@ActorChips <= 5 * @Unit
+                                        AND @ActorRank1 = @ActorRank2 AND @ActorRank1 >= 12
+                                        AND @r < 60))
                               THEN 1 ELSE 0 END;
 
             IF @Owed > 0
@@ -1156,8 +1165,11 @@ BEGIN
                     UPDATE ##TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
                 END
                 INSERT ##TexasHoldEm_Log (HandNumber, Message)
-                VALUES (@GHand, CASE WHEN @AllInTo > @BetToCall
-                        THEN CONCAT(@ActorName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                VALUES (@GHand, CASE
+                        WHEN @AllInTo > @BetToCall
+                            THEN CONCAT(@ActorName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                        WHEN @AllInTo = @BetToCall
+                            THEN CONCAT(@ActorName, N' calls ALL IN for ', @Pay, N'.')
                         ELSE CONCAT(@ActorName, N' calls ALL IN for ', @Pay,
                                     N', which doesn''t cover the ', @BetToCall, N'.') END);
             END
