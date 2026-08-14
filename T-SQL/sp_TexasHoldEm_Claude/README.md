@@ -31,7 +31,7 @@ Two builds live in this folder:
 3. In other windows (up to 4 seats total):
 
    ```sql
-   EXEC sp_TexasHoldEm @PlayerName = 'Erika';
+   EXEC sp_TexasHoldEm @PlayerName = 'Claude';
    ```
 
    If nobody joins within 60 seconds, three robots sit in: **Clippy**,

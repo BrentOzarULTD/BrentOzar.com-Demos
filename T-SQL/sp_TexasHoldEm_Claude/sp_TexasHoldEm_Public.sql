@@ -75,7 +75,7 @@ HOW TO PLAY
      but @SeatPassword is the ONLY way to reconnect from a new session and
      reclaim your seat, so set one if you like your chips.
 
-  2. In other windows/sessions:   EXEC sp_TexasHoldEm_Public @PlayerName = 'Erika';
+  2. In other windows/sessions:   EXEC sp_TexasHoldEm_Public @PlayerName = 'Claude';
      Up to 4 seats. If nobody else joins within 60 seconds, you play against
      three robots: Clippy, HAL, and Bender. If the table's full, you watch
      from the rail as an observer and see what the public sees.
@@ -1620,7 +1620,7 @@ GO
 /* Quick demo:
 
    Window 1:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Brent', @SeatPassword = 'hunter2';
-   Window 2:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Erika', @SeatPassword = 'yeehaw';   (within 60 seconds)
+   Window 2:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Claude', @SeatPassword = 'yeehaw';   (within 60 seconds)
    Window 3:  EXEC sp_TexasHoldEm_Public @Action = 'Status';      (instant peek, never blocks)
 
    Then just do what the [What Now] result set tells you. If a window dies,
