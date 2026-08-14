@@ -408,8 +408,15 @@ END
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
    impersonate other players with, no consecutive spaces to fake a lookalike. */
+/* The literal chars go BEFORE the A-Za-z0-9 ranges in this bracket list on
+   purpose: under a binary collation, SQL Server's LIKE silently drops a
+   trailing literal underscore/dash from a character class when it comes
+   after adjacent A-Z/a-z/0-9 ranges (reproduced directly against the
+   engine), which rejected every legitimate name containing either
+   character. Leading with the literals sidesteps the engine bug - it's not
+   just cosmetic reordering. */
 IF @PlayerName IS NOT NULL
-   AND (@PlayerName LIKE N'%[^A-Za-z0-9 ._-]%' COLLATE Latin1_General_100_BIN2
+   AND (@PlayerName LIKE N'%[^_ .A-Za-z0-9-]%' COLLATE Latin1_General_100_BIN2
         OR @PlayerName LIKE N'%  %')
 BEGIN
     SELECT [Say What?] = N'Player names here are boring on purpose: up to 30 characters of letters, numbers, single spaces, dots, dashes, and underscores. No emoji, no zero-width shenanigans, no pretending to be somebody else.';
@@ -441,8 +448,15 @@ END
    (permission denied - the healthy state, carry on), while a missing
    table raises error 208 from a lower execution level, which - unlike a
    same-scope compile error - this proc CAN catch and translate. */
+DECLARE @ProbeDummy int;
 BEGIN TRY
-    EXEC sp_executesql N'SELECT TOP (0) 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist;';
+    /* SELECT @var = ... (not a bare SELECT) so this probe never sends the
+       caller a phantom empty result set - the documented contract is
+       exactly four result sets (Hand, Seat, What Now, What Happened) every
+       call, and a stray fifth one would break any client that reads them
+       by position. */
+    EXEC sp_executesql N'SELECT @ProbeDummy = 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist;',
+        N'@ProbeDummy int OUTPUT', @ProbeDummy OUTPUT;
 END TRY
 BEGIN CATCH
     IF ERROR_NUMBER() = 208
