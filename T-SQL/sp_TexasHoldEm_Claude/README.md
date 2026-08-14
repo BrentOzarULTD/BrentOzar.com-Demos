@@ -66,7 +66,15 @@ The four result sets keep the same order and shape in both modes.
 | `Leave` | Cash out (folds first if you're mid-hand) |
 | `Watch` | Spectate without taking a seat |
 | `Status` | Instant snapshot of the table — never blocks |
+| `NewGame` | Open a fresh lobby after `GAME OVER` |
+| `Reset` | Atomically abandon any table and open a fresh lobby (database administrators only) |
 | `Help` | Cheat sheet |
+
+Actions are case-insensitive. A normal join after `GAME OVER` still starts a
+new game for backward compatibility; `NewGame` makes that lifecycle choice
+explicit. `Reset` clears seats, waitlist reservations, cards, bets, pot, and
+game log state under the game lock, and records the initiating database
+identity in the new log without including credentials.
 
 ## House rules
 
