@@ -256,6 +256,7 @@ DECLARE @rc int,
         @TargetHand int = 0,
         @WaitStart datetime2 = SYSDATETIME(),
         @LastLogId int = 0,
+        @LastNotice nvarchar(500),
         /* Where "this turn" starts in the log: whatever was already on the
            board when this call picked the game up. */
         @TurnStartLogId int = 0,
@@ -1539,11 +1540,10 @@ BEGIN
         SET @CardsShownForHand = @GHand;
     END
 
-    IF @Notice IS NOT NULL
-    BEGIN
-        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
-        SET @Notice = NULL;
-    END
+    /* Hang onto the notice. If this pass turns out to be the one that hands
+       results back, the severity-11 raise at the very bottom delivers it and
+       drags SSMS over to the Messages tab. */
+    IF @Notice IS NOT NULL SET @LastNotice = @Notice;
 
     /* Is there a reason to give this session its results back? */
     IF @ReturnNow = 1 BREAK;
@@ -1562,6 +1562,15 @@ BEGIN
     BEGIN
         SET @GaveUp = 1;
         BREAK;
+    END
+
+    /* Still waiting, so say it now rather than making them wait for the
+       end-of-proc raise - and clear it, since they've now seen it. */
+    IF @Notice IS NOT NULL
+    BEGIN
+        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
+        SET @Notice = NULL;
+        SET @LastNotice = NULL;
     END
 
     IF @ToldWaiting = 0
@@ -1780,6 +1789,18 @@ BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK;
     THROW;
 END CATCH
+
+/* SSMS focuses the Results grid whenever a query returns one, and this proc
+   always returns one, so whatever we said in the Messages tab gets buried the
+   moment the query finishes. Severity 11+ is the only thing that pulls focus
+   back there, so when the player needs to READ something - a rejected action,
+   a "not your turn" - we hand it back as an error on the way out. Severity 11
+   doesn't abort the batch and leaves SQLCMD's exit code at 0; it just turns
+   the text red and wins the argument about which tab you're looking at. This
+   lives after END CATCH on purpose: raised inside the TRY, the CATCH above
+   would swallow it and roll the game back. */
+IF @LastNotice IS NOT NULL
+    RAISERROR(N'%s', 11, 1, @LastNotice);
 END
 GO
 
