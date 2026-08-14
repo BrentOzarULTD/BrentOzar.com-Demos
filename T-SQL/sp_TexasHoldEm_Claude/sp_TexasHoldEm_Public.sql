@@ -547,7 +547,7 @@ END TRY
 BEGIN CATCH
     IF ERROR_NUMBER() = 208
     BEGIN
-        SELECT [Not Deployed] = N'The casino hasn''t been built: the dbo.TexasHoldEm_* tables are missing. An admin needs to run the full setup script from the top of this proc''s source file.';
+        SELECT [Not Deployed] = N'The casino hasn''t been built: the TexasHoldEm_Public.TexasHoldEm_* tables are missing. An admin needs to run the full setup script from the top of this proc''s source file.';
         RETURN;
     END
 END CATCH
