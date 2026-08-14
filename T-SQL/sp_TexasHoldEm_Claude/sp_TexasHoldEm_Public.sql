@@ -207,6 +207,10 @@ CREATE TABLE dbo.TexasHoldEm_Waitlist (
     SessionLoginTime datetime2 NULL,
     PasswordSalt varbinary(16) NULL,
     PasswordHash varbinary(32) NULL,
+    /* NULL = ordinary FIFO waiter. Non-NULL = this specific seat was
+       promised to this human when a robot got bumped mid-hand - see the
+       mid-hand bump branch below. Reserved entries skip the FIFO line. */
+    ReservedSeat tinyint NULL,
     JoinedAt datetime2 NOT NULL DEFAULT SYSDATETIME());
 
 IF OBJECT_ID(N'dbo.TexasHoldEm_Log', N'U') IS NULL
@@ -291,7 +295,7 @@ DECLARE @rc int,
         /* my seat snapshot */
         @SeatExists bit, @CurOwner int, @CurLoginTime datetime2,
         @SeatSalt varbinary(16), @SeatHash varbinary(32),
-        @FoundBySession bit = 0, @WaitId int, @WaitPos int,
+        @FoundBySession bit = 0, @WaitId int, @WaitPos int, @MyReservedSeat tinyint,
         @MyNeedsToAct bit, @MyFolded bit,
         @MyChips int, @MyBet int, @MyC1 tinyint, @MyC2 tinyint, @MyCards nvarchar(12),
         /* engine workspace */
@@ -617,16 +621,16 @@ BEGIN
            seated player is recognized: by session first, then by name+password
            if the original session died. Otherwise re-running the same command
            to check status would just keep adding duplicate waitlist entries. */
-        SET @WaitId = NULL;
+        SET @WaitId = NULL; SET @MyReservedSeat = NULL;
         IF @MySeat IS NULL
         BEGIN
-            SELECT @WaitId = WaitId FROM dbo.TexasHoldEm_Waitlist
+            SELECT @WaitId = WaitId, @MyReservedSeat = ReservedSeat FROM dbo.TexasHoldEm_Waitlist
              WHERE SessionId = @@SPID AND SessionLoginTime = @MyLoginTime;
             IF @WaitId IS NULL AND @PlayerName IS NOT NULL
                AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
             BEGIN
                 SET @CurOwner = NULL; SET @SeatSalt = NULL; SET @SeatHash = NULL;
-                SELECT @WaitId = WaitId, @CurOwner = SessionId,
+                SELECT @WaitId = WaitId, @CurOwner = SessionId, @MyReservedSeat = ReservedSeat,
                        @SeatSalt = PasswordSalt, @SeatHash = PasswordHash
                   FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName;
                 IF @WaitId IS NOT NULL
@@ -658,9 +662,14 @@ BEGIN
                 SET @LeftTable = 1;
                 SET @ReturnNow = 1;
             END
+            ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @MyReservedSeat IS NOT NULL
+            BEGIN
+                SET @Notice = N'Your seat is reserved - a robot is giving it up at the end of the current hand. Run EXEC sp_TexasHoldEm_Public again in a bit to sit down.';
+                SET @ReturnNow = 1;
+            END
             ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0
             BEGIN
-                SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId;
+                SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId AND ReservedSeat IS NULL;
                 SET @Notice = CONCAT(N'Still on the waitlist, #', @WaitPos,
                     N' in line for a seat. Run EXEC sp_TexasHoldEm_Public again in a bit',
                     N', or EXEC sp_TexasHoldEm_Public @Action = ''Leave'' to give up your spot.');
@@ -681,6 +690,49 @@ BEGIN
             END
             ELSE
             BEGIN
+                /* Before deciding whether there's room for ME, give any
+                   reserved-or-queued human first crack at a seat that's
+                   already sitting empty - a chair emptying out between
+                   hands doesn't wait for the next deal to be claimed, and
+                   it never goes to a brand-new arrival ahead of someone
+                   already promised it or already in line. Bots are NOT
+                   added here - that stays a hand-boundary thing, so a plain
+                   join attempt can't spawn a robot early. */
+                DELETE @Promoted;
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+                SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                FROM dbo.TexasHoldEm_Waitlist w
+                WHERE w.ReservedSeat IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
+
+                ;WITH freeseats AS (
+                    SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
+                    FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
+                    WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
+                      AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
+                waiters AS (
+                    SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+                           rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
+                    FROM dbo.TexasHoldEm_Waitlist w
+                    WHERE w.ReservedSeat IS NULL)
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+                SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                FROM freeseats f JOIN waiters w ON w.rn = f.rn;
+
+                IF EXISTS (SELECT 1 FROM @Promoted)
+                BEGIN
+                    INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
+                                                    PasswordSalt, PasswordHash, IsBot, Chips)
+                    SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, @StartingChips
+                    FROM @Promoted;
+
+                    DELETE dbo.TexasHoldEm_Waitlist WHERE WaitId IN (SELECT WaitId FROM @Promoted);
+
+                    INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                    SELECT g.HandNumber, CONCAT(pr.PlayerName, N' is off the waitlist and sits down with ', @StartingChips, N' chips.')
+                    FROM @Promoted pr CROSS JOIN dbo.TexasHoldEm_Game g;
+                END
+
                 IF (SELECT COUNT(*) FROM dbo.TexasHoldEm_Players) >= @MaxSeats
                 BEGIN
                     /* Full table, but robots don't get to keep a human out. Bump
@@ -703,8 +755,38 @@ BEGIN
                         INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
                         SELECT HandNumber, CONCAT(@BumpName, N' is cashing out after this hand to free up a seat for a human.')
                         FROM dbo.TexasHoldEm_Game;
-                        SET @IsObserver = 1;
-                        SET @Notice = CONCAT(@BumpName, N' is giving up a seat for you at the end of this hand. Watching from the rail until then - run EXEC sp_TexasHoldEm_Public again to sit down.');
+
+                        /* Reserve that exact seat right now - a promise with
+                           nothing behind it is just a race. Without this, a
+                           different arrival (or an already-waitlisted human)
+                           could claim the seat the moment it actually frees. */
+                        IF @PlayerName IS NULL
+                        BEGIN
+                            SET @PlayerName = CONCAT(N'Player ', @@SPID);
+                            IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
+                               OR EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                                SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
+                                    100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
+                        END
+                        ELSE IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                        BEGIN
+                            SET @Notice = N'That name''s already on the waitlist. Pick a different one.';
+                            SET @ReturnNow = 1;
+                        END
+
+                        IF @ReturnNow = 0
+                        BEGIN
+                            SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                            SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                 THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+
+                            INSERT dbo.TexasHoldEm_Waitlist (PlayerName, SessionId, SessionLoginTime,
+                                                             PasswordSalt, PasswordHash, ReservedSeat)
+                            VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, @BumpSeat);
+
+                            SET @IsObserver = 1;
+                            SET @Notice = CONCAT(@BumpName, N' is giving up their seat for you at the end of this hand - it''s reserved. Watching from the rail until then - run EXEC sp_TexasHoldEm_Public again to sit down.');
+                        END
                     END
                     ELSE IF @BumpSeat IS NOT NULL
                     BEGIN
@@ -1025,21 +1107,31 @@ BEGIN
 
         IF @StartHandNow = 1
         BEGIN
-            /* Before every hand (not just the first one): pull whoever's
-               waited longest off the waitlist and into the empty chairs
-               first, then fill whatever's left with robots so the table
-               always plays full. They're seat-warmers, not regulars - the
-               next human to walk up takes a robot's chair instead of going
-               to the rail. */
+            /* Before every hand (not just the first one): honor any seat
+               reservations first (a robot got bumped mid-hand and promised
+               its chair to a specific human - see the bump branch above),
+               then pull whoever's waited longest in the general FIFO line
+               into whatever's still empty, then fill the rest with robots
+               so the table always plays full. Robots are seat-warmers, not
+               regulars - the next human to walk up takes a robot's chair
+               instead of going to the rail. */
             DELETE @Promoted;
+            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+            SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+            FROM dbo.TexasHoldEm_Waitlist w
+            WHERE w.ReservedSeat IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
+
             ;WITH freeseats AS (
                 SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
                 FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
-                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)),
+                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
+                  AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
             waiters AS (
                 SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
                        rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
-                FROM dbo.TexasHoldEm_Waitlist w)
+                FROM dbo.TexasHoldEm_Waitlist w
+                WHERE w.ReservedSeat IS NULL)   /* reserved rows are handled above, on their own seat only */
             INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
             SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
             FROM freeseats f JOIN waiters w ON w.rn = f.rn;
