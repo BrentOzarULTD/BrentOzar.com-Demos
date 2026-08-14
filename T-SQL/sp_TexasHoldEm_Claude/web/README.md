@@ -6,8 +6,9 @@ This folder contains two deployable pieces:
   /api/poker/state` calls `dbo.sp_TexasHoldEm_Public` as a spectator and turns
   its four result sets into JSON.
 - `wordpress/texas-holdem-viewer/` is a WordPress plugin that provides the
-  `[texas_holdem_viewer]` shortcode and refreshes the displayed game every 10
-  seconds without reloading the page.
+  `[texas_holdem_viewer]` shortcode and renders the live game as a CSS-drawn
+  poker table. It refreshes every 10 seconds without reloading the page and
+  automatically arranges up to eight players around the felt.
 
 The Function keeps a 10-second, single-flight in-memory snapshot. Concurrent
 requests handled by one warm Function instance share one SQL call. A scaled-out
@@ -138,7 +139,9 @@ In WordPress:
 
 5. Publish the page. In the browser's Network panel, confirm that the Function
    endpoint is fetched about every ten seconds and the document itself is not
-   reloaded.
+   reloaded. The table intentionally expands to the full browser width instead
+   of inheriting the WordPress theme's content-column width, then scales its
+   fixed layout down uniformly on narrower screens.
 
 For a temporary test without editing `wp-config.php`, the endpoint may be
 passed directly:
@@ -152,6 +155,10 @@ passed directly:
 - The API permits CORS only from the exact production WordPress origin,
   including `www` when the site uses it.
 - The page shows only public cards until showdown.
+- Hidden hole cards render as card backs; community-card spaces that have not
+  been dealt yet render as `SOON™` placeholders.
+- The acting player has a gold pulsing border, folded players are dimmed, and
+  all animation stops when the visitor requests reduced motion.
 - Stopping Azure SQL leaves the last successful snapshot visible with a stale
   warning; a brand-new Function instance with no snapshot returns HTTP 503.
 - SQL resumes with no WordPress changes after a transient outage.
@@ -173,4 +180,7 @@ php -l \
 
 node --check \
   T-SQL/sp_TexasHoldEm_Claude/web/wordpress/texas-holdem-viewer/assets/poker-viewer.js
+
+node --test \
+  T-SQL/sp_TexasHoldEm_Claude/web/wordpress/tests/poker-viewer.test.js
 ```
