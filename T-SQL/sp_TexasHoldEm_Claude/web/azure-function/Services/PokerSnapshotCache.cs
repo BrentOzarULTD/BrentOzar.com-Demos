@@ -12,8 +12,7 @@ public sealed class PokerSnapshotCache
     private readonly TimeSpan _ttl;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
-    private PokerSnapshot? _snapshot;
-    private DateTimeOffset _expiresAt;
+    private CacheEntry? _entry;
 
     public PokerSnapshotCache(
         IPokerSnapshotSource source,
@@ -39,13 +38,20 @@ public sealed class PokerSnapshotCache
 
     public async Task<PokerSnapshot> GetAsync(CancellationToken cancellationToken)
     {
+        var entry = Volatile.Read(ref _entry);
+        if (entry is not null && _timeProvider.GetUtcNow() < entry.ExpiresAt)
+        {
+            return entry.Snapshot;
+        }
+
         await _refreshLock.WaitAsync(cancellationToken);
         try
         {
             var now = _timeProvider.GetUtcNow();
-            if (_snapshot is not null && now < _expiresAt)
+            entry = Volatile.Read(ref _entry);
+            if (entry is not null && now < entry.ExpiresAt)
             {
-                return _snapshot;
+                return entry.Snapshot;
             }
 
             try
@@ -53,16 +59,20 @@ public sealed class PokerSnapshotCache
                 // A disconnected HTTP client must not cancel a refresh shared by the whole Function instance.
                 // SqlPokerSnapshotSource still bounds this work with PokerCommandTimeoutSeconds.
                 var refreshed = await _source.LoadAsync(CancellationToken.None);
-                _snapshot = refreshed with { Stale = false };
-                _expiresAt = _timeProvider.GetUtcNow().Add(_ttl);
-                return _snapshot;
+                var refreshedEntry = new CacheEntry(
+                    refreshed with { Stale = false },
+                    _timeProvider.GetUtcNow().Add(_ttl));
+                Volatile.Write(ref _entry, refreshedEntry);
+                return refreshedEntry.Snapshot;
             }
-            catch (Exception exception) when (_snapshot is not null && exception is not OperationCanceledException)
+            catch (Exception exception) when (entry is not null && exception is not OperationCanceledException)
             {
                 _logger.LogWarning(exception, "Poker snapshot refresh failed; serving the last successful snapshot.");
-                _snapshot = _snapshot with { Stale = true };
-                _expiresAt = _timeProvider.GetUtcNow().Add(_ttl);
-                return _snapshot;
+                var staleEntry = new CacheEntry(
+                    entry.Snapshot with { Stale = true },
+                    _timeProvider.GetUtcNow().Add(_ttl));
+                Volatile.Write(ref _entry, staleEntry);
+                return staleEntry.Snapshot;
             }
         }
         finally
@@ -70,4 +80,6 @@ public sealed class PokerSnapshotCache
             _refreshLock.Release();
         }
     }
+
+    private sealed record CacheEntry(PokerSnapshot Snapshot, DateTimeOffset ExpiresAt);
 }

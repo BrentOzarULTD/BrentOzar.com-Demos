@@ -13,6 +13,19 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+const BRENT_OZAR_TEXAS_HOLDEM_VIEWER_VERSION = '0.1.0';
+
+/**
+ * Use the asset timestamp for cache busting, with a safe fallback for partial deploys.
+ */
+function brentozar_texas_holdem_viewer_asset_version(string $path): string
+{
+    $modified_at = is_readable($path) ? @filemtime($path) : false;
+    return $modified_at === false
+        ? BRENT_OZAR_TEXAS_HOLDEM_VIEWER_VERSION
+        : (string) $modified_at;
+}
+
 /**
  * Render [texas_holdem_viewer].
  *
@@ -48,13 +61,13 @@ function brentozar_texas_holdem_viewer_shortcode($attributes): string
         'brentozar-texas-holdem-viewer',
         $plugin_url . 'assets/poker-viewer.css',
         array(),
-        (string) filemtime($plugin_path . 'assets/poker-viewer.css')
+        brentozar_texas_holdem_viewer_asset_version($plugin_path . 'assets/poker-viewer.css')
     );
     wp_enqueue_script(
         'brentozar-texas-holdem-viewer',
         $plugin_url . 'assets/poker-viewer.js',
         array(),
-        (string) filemtime($plugin_path . 'assets/poker-viewer.js'),
+        brentozar_texas_holdem_viewer_asset_version($plugin_path . 'assets/poker-viewer.js'),
         true
     );
 
