@@ -75,16 +75,24 @@ HOW TO PLAY
      but @SeatPassword is the ONLY way to reconnect from a new session and
      reclaim your seat, so set one if you like your chips.
 
-  2. In other windows/sessions:   EXEC sp_TexasHoldEm_Public @PlayerName = 'Erika';
-     Up to 4 seats. If nobody else joins within 60 seconds, you play against
-     three robots: Clippy, HAL, and Bender. If the table's full, you watch
-     from the rail as an observer and see what the public sees.
+  2. In other windows/sessions:   EXEC sp_TexasHoldEm_Public @PlayerName = 'Claude';
+     4 physical seats, up to 8 humans total. Any chair still empty when the
+     join window closes gets a robot in it - Clippy, HAL, and Bender - so the
+     table always plays full. The next human to walk up takes a robot's
+     chair rather than going to the rail (mid-hand, the robot cashes out at
+     the end of the hand first). Once all 4 seats are humans, the next
+     arrivals - up to 4 more - queue on a waitlist and get seated the moment
+     a chair opens, in line order. Only 8 humans deep (4 seated + 4 waiting)
+     actually puts you on the rail as an observer, seeing what the public
+     sees. Already at the table and want a different name? Just pass a new
+     @PlayerName - it takes effect immediately if nobody else has it.
 
   3. Your query "runs" while you wait - that's the design. Watch the Messages
      tab: the action streams in live. The query finishes when YOU need to do
      something, and the results tell you exactly what to run, like:
         EXEC sp_TexasHoldEm_Public @Action = 'Call',  @PlayerName = 'Brent';
         EXEC sp_TexasHoldEm_Public @Action = 'Raise', @PlayerName = 'Brent';
+        EXEC sp_TexasHoldEm_Public @Action = 'AllIn', @PlayerName = 'Brent';
         EXEC sp_TexasHoldEm_Public @Action = 'Fold',  @PlayerName = 'Brent';
      After a hand ends, run EXEC sp_TexasHoldEm_Public again to keep playing.
 
@@ -97,7 +105,7 @@ HOW TO PLAY
         'ThisGame'   - every hand of the game currently being played.
         'AllHistory' - the whole log, all the way back. Bring popcorn.
 
-Actions: Join (default), Check, Call, Bet, Raise, Fold, Leave, Watch,
+Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
          Status (instant snapshot, never blocks), Help.
 
 House rules:
@@ -107,8 +115,13 @@ House rules:
     if a seat is open - the log will shame you appropriately).
   - 60-second shot clock per decision. Take too long and you auto-check or
     auto-fold; three strikes and your seat goes to the next player.
+  - AllIn is the one move the limit doesn't limit: shove your whole stack any
+    time it's your turn, even when the raise cap is maxed out. The robots will
+    do it to you too, but only when they're short-stacked.
   - No side pots: you can call all-in for less, and if you win you take the
     whole pot. Vegas would not approve. Vegas also isn't a stored procedure.
+    The only mercy is that an uncalled bet comes back to you - shove 500 into
+    a player who only had 200 and you get the extra 300 returned.
 
 Requirements & caveats:
   - SQL Server 2017+ or Azure SQL DB (uses STRING_AGG).
@@ -128,7 +141,7 @@ GO
    ONE-TIME SETUP: the game tables. Run as an admin (someone with dbo
    rights). Idempotent - re-running won't wipe a game in progress. To
    burn the casino down on purpose:
-       DROP TABLE dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Game;
+       DROP TABLE dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Game;
    ===================================================================== */
 IF OBJECT_ID(N'dbo.TexasHoldEm_Game', N'U') IS NULL
 CREATE TABLE dbo.TexasHoldEm_Game (
@@ -183,6 +196,23 @@ CREATE TABLE dbo.TexasHoldEm_Players (
     TimeoutStrikes tinyint NOT NULL DEFAULT 0,
     WantsToLeave bit NOT NULL DEFAULT 0);
 
+/* Humans who showed up after all 4 physical seats (and every robot) were
+   already spoken for. First in line gets the next chair that opens - see
+   @MaxHumans / @MaxWaitlist below for the caps. */
+IF OBJECT_ID(N'dbo.TexasHoldEm_Waitlist', N'U') IS NULL
+CREATE TABLE dbo.TexasHoldEm_Waitlist (
+    WaitId int IDENTITY(1,1) PRIMARY KEY,
+    PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS NOT NULL UNIQUE,
+    SessionId int NOT NULL,
+    SessionLoginTime datetime2 NULL,
+    PasswordSalt varbinary(16) NULL,
+    PasswordHash varbinary(32) NULL,
+    /* NULL = ordinary FIFO waiter. Non-NULL = this specific seat was
+       promised to this human when a robot got bumped mid-hand - see the
+       mid-hand bump branch below. Reserved entries skip the FIFO line. */
+    ReservedSeat tinyint NULL,
+    JoinedAt datetime2 NOT NULL DEFAULT SYSDATETIME());
+
 IF OBJECT_ID(N'dbo.TexasHoldEm_Log', N'U') IS NULL
 CREATE TABLE dbo.TexasHoldEm_Log (
     LogId int IDENTITY(1,1) PRIMARY KEY,
@@ -220,13 +250,15 @@ DECLARE @SmallBlind int = 10,
         @BigBet int = 40,            /* bet size on the turn and river */
         @MaxRaises int = 4,          /* one bet + three raises per round */
         @StartingChips int = 1000,
-        @MaxSeats int = 4,
+        @MaxSeats int = 4,           /* physical chairs at the table */
+        @MaxHumans int = 8,          /* total humans allowed in the game: seated + waitlisted */
         @JoinWindowSeconds int = 60,
         @TurnSeconds int = 60,       /* the shot clock */
         @MaxTimeoutStrikes int = 3,
         @BetweenHandsSeconds int = 10,
         @MaxWaitMinutes int = 30,    /* give up blocking after this long - waiting queries hold worker threads */
         @AbandonedAfterMinutes int = 30;  /* sweep a table nobody's touched in this long */
+DECLARE @MaxWaitlist int = @MaxHumans - @MaxSeats;
 
 DECLARE @rc int,
         @Msg nvarchar(2047),
@@ -247,6 +279,7 @@ DECLARE @rc int,
         @TargetHand int = 0,
         @WaitStart datetime2 = SYSDATETIME(),
         @LastLogId int = 0,
+        @LastNotice nvarchar(500),
         /* Where "this turn" starts in the log: whatever was already on the
            board when this call picked the game up. */
         @TurnStartLogId int = 0,
@@ -262,6 +295,7 @@ DECLARE @rc int,
         /* my seat snapshot */
         @SeatExists bit, @CurOwner int, @CurLoginTime datetime2,
         @SeatSalt varbinary(16), @SeatHash varbinary(32),
+        @FoundBySession bit = 0, @WaitId int, @WaitPos int, @MyReservedSeat tinyint,
         @MyNeedsToAct bit, @MyFolded bit,
         @MyChips int, @MyBet int, @MyC1 tinyint, @MyC2 tinyint, @MyCards nvarchar(12),
         /* engine workspace */
@@ -269,7 +303,11 @@ DECLARE @rc int,
         @NumPlayers int, @HumansLeft int, @NumInHand int, @Unfolded int, @ActiveBettors int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
-        @Owed int, @Unit int, @NewBet int, @Pay int, @NextSeat tinyint, @r int,
+        @ActorRank1 int, @ActorRank2 int, @CanRaise bit, @Shove bit,
+        @Owed int, @Unit int, @NewBet int, @Pay int, @AllInTo int, @NextSeat tinyint, @r int,
+        @TopBet int, @NextBet int, @RefundSeat tinyint, @Refund int,
+        @BumpSeat tinyint, @BumpName nvarchar(30),
+        @BotsAdded int,
         @BotMove varchar(10), @RoundBets int, @WinSeat tinyint, @WinName nvarchar(30),
         /* showdown & hand evaluation */
         @cSeat tinyint, @cName nvarchar(30), @cC1 tinyint, @cC2 tinyint,
@@ -288,6 +326,8 @@ DECLARE @FRanks TABLE (CardRank int);
 DECLARE @ShowResults TABLE (SeatNum tinyint, PlayerName nvarchar(30), Score bigint, HandName nvarchar(60));
 DECLARE @Prompt TABLE (LineId int IDENTITY(1,1), Line nvarchar(300));
 DECLARE @Happened TABLE (LogId int, Message nvarchar(500));
+DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30),
+    SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32));
 
 /* A deck of cards. CardId 0-51: rank = CardId / 4 + 2 (2..14), suit = CardId % 4. */
 CREATE TABLE #Poker_Cards (CardId tinyint PRIMARY KEY, CardRank int, CardSuit tinyint, Display nvarchar(3));
@@ -310,6 +350,9 @@ SET @PlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
 SET @SeatPassword = NULLIF(@SeatPassword, N'');
 SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
 IF @Action = N'Join' SET @Action = NULL;
+/* Nobody types the same thing twice under pressure. Take all of them. */
+IF @Action COLLATE Latin1_General_100_CI_AS IN (N'All In', N'All-In', N'All_In', N'Shove', N'Jam')
+    SET @Action = N'AllIn';
 
 /* Explicit CI collation so this behaves the same on a case-sensitive
    database - the value picks a code path, so it can't drift with collation. */
@@ -328,10 +371,10 @@ SET @ShowWhatHappened = CASE
     ELSE N'ThisTurn' END;
 
 IF @Action IS NOT NULL
-   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
+   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
 BEGIN
     SELECT [Say What?] = CONCAT(N'I don''t know the action ''', @Action,
-        N'''. Try: Join, Check, Call, Bet, Raise, Fold, Leave, Watch, Status, or Help.');
+        N'''. Try: Join, Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch, Status, or Help.');
     RETURN;
 END
 
@@ -344,16 +387,19 @@ BEGIN
         (3, N'EXEC sp_TexasHoldEm_Public @Action = ''Check'',  @PlayerName = ''YourName'';'),
         (4, N'EXEC sp_TexasHoldEm_Public @Action = ''Call'',   @PlayerName = ''YourName'';'),
         (5, N'EXEC sp_TexasHoldEm_Public @Action = ''Raise'',  @PlayerName = ''YourName'';  -- ''Bet'' works too'),
-        (6, N'EXEC sp_TexasHoldEm_Public @Action = ''Fold'',   @PlayerName = ''YourName'';'),
-        (7, N'EXEC sp_TexasHoldEm_Public @Action = ''Leave'',  @PlayerName = ''YourName'';  -- cash out'),
-        (8, N'EXEC sp_TexasHoldEm_Public @Action = ''Watch'';                              -- spectate, never sits you down'),
-        (9, N'EXEC sp_TexasHoldEm_Public @Action = ''Status'';                             -- instant snapshot, never blocks'),
-        (10,N'From your original session, actions just work. From a NEW session, add your @SeatPassword.'),
-        (11,N'While your query runs, watch the Messages tab - the action streams in live.'),
-        (12,N'The query finishes when it''s your turn, and tells you exactly what to run next.'),
-        (13,N'Results come back as: Hand, Seat, What Now, What Happened.'),
-        (14,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
-        (15,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for every hand ever played here.')
+        (6, N'EXEC sp_TexasHoldEm_Public @Action = ''AllIn'',  @PlayerName = ''YourName'';  -- shove the whole stack'),
+        (7, N'EXEC sp_TexasHoldEm_Public @Action = ''Fold'',   @PlayerName = ''YourName'';'),
+        (8, N'EXEC sp_TexasHoldEm_Public @Action = ''Leave'',  @PlayerName = ''YourName'';  -- cash out'),
+        (9, N'EXEC sp_TexasHoldEm_Public @Action = ''Watch'';                              -- spectate, never sits you down'),
+        (10,N'EXEC sp_TexasHoldEm_Public @Action = ''Status'';                             -- instant snapshot, never blocks'),
+        (11,N'From your original session, actions just work. From a NEW session, add your @SeatPassword.'),
+        (12,N'Already seated and pass a different @PlayerName? That''s a rename - takes effect right away.'),
+        (13,N'Table''s full (4 seats)? Up to 4 more humans can wait on a queue and get seated in line order.'),
+        (14,N'While your query runs, watch the Messages tab - the action streams in live.'),
+        (15,N'The query finishes when it''s your turn, and tells you exactly what to run next.'),
+        (16,N'Results come back as: Hand, Seat, What Now, What Happened.'),
+        (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
+        (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for every hand ever played here.')
         ) v(LineId, Line)
     ORDER BY v.LineId;
     RETURN;
@@ -396,7 +442,7 @@ END
    table raises error 208 from a lower execution level, which - unlike a
    same-scope compile error - this proc CAN catch and translate. */
 BEGIN TRY
-    EXEC sp_executesql N'SELECT TOP (0) 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log;';
+    EXEC sp_executesql N'SELECT TOP (0) 1 FROM dbo.TexasHoldEm_Game, dbo.TexasHoldEm_Players, dbo.TexasHoldEm_Log, dbo.TexasHoldEm_Waitlist;';
 END TRY
 BEGIN CATCH
     IF ERROR_NUMBER() = 208
@@ -455,13 +501,16 @@ BEGIN
     BEGIN
         SET @FirstPass = 0;
 
+        /* The Messages tab still gets a short backlog for context, because
+           scrolling into a hand cold is confusing. */
         SET @LastLogId = ISNULL((SELECT MAX(LogId) FROM dbo.TexasHoldEm_Log), 0) - 12;
         IF @LastLogId < 0 SET @LastLogId = 0;
-        /* Where "this turn" starts, deliberately including the same short
-           backlog the streaming loop replays: what the What Happened result
-           set shows should match what scrolled past in the Messages tab,
-           not diverge from it. */
-        SET @TurnStartLogId = @LastLogId;
+        /* ...but the What Happened grid starts HERE, at the log's actual high
+           water mark, so it holds this turn and nothing else. The log outlives
+           games in the public build, so anchoring the grid to the backlog
+           instead meant a fresh session opened on the tail of somebody else's
+           finished hand. Pass @ShowWhatHappened = 'ThisGame' to see more. */
+        SET @TurnStartLogId = ISNULL((SELECT MAX(LogId) FROM dbo.TexasHoldEm_Log), 0);
 
         /* On a public server, tables get abandoned mid-hand. If nothing has
            happened for a while, sweep the chips and reset rather than making
@@ -471,6 +520,7 @@ BEGIN
                < DATEADD(minute, -@AbandonedAfterMinutes, SYSDATETIME())
         BEGIN
             DELETE dbo.TexasHoldEm_Players;
+            DELETE dbo.TexasHoldEm_Waitlist;
             UPDATE dbo.TexasHoldEm_Game
                SET GameState = 'GameOver', TurnSeat = NULL, NextHandStartsAt = NULL;
             INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
@@ -499,13 +549,14 @@ BEGIN
         /* Find my seat: by session identity first (session_id + login_time),
            then by name - but reclaiming a seat by name from a different
            session requires the seat's password. That's the whole point. */
-        SET @MySeat = NULL;
+        SET @MySeat = NULL; SET @FoundBySession = 0;
         SELECT @MySeat = SeatNum FROM dbo.TexasHoldEm_Players
          WHERE SessionId = @@SPID AND SessionLoginTime = @MyLoginTime AND IsBot = 0;
+        IF @MySeat IS NOT NULL SET @FoundBySession = 1;
         /* Only actions that actually take control of the seat may reclaim it -
            a Status or Watch peek must never hijack a live player's session. */
         IF @MySeat IS NULL AND @PlayerName IS NOT NULL
-           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave'))
+           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
         BEGIN
             SET @CurOwner = NULL; SET @SeatSalt = NULL; SET @SeatHash = NULL;
             SELECT @MySeat = SeatNum, @CurOwner = SessionId,
@@ -537,76 +588,322 @@ BEGIN
                 END
             END
         END
+        /* Renaming: this is YOUR live session (not a reclaim - reclaiming a
+           seat by name is how a dead session gets back in, so that path can't
+           also mean "rename me") and you passed a name that isn't what's on
+           your seat. Take it, as long as nobody else at the table or on the
+           waitlist already has it. */
+        IF @FoundBySession = 1 AND @PlayerName IS NOT NULL
+           AND @PlayerName <> (SELECT PlayerName FROM dbo.TexasHoldEm_Players WHERE SeatNum = @MySeat)
+               COLLATE Latin1_General_100_CI_AS
+        BEGIN
+            IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName AND SeatNum <> @MySeat)
+               OR EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                SET @Notice = N'That name''s already taken, so your name is unchanged.';
+            ELSE
+            BEGIN
+                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                SELECT g.HandNumber, CONCAT(p.PlayerName, N' is now known as ', @PlayerName, N'.')
+                FROM dbo.TexasHoldEm_Game g CROSS JOIN dbo.TexasHoldEm_Players p WHERE p.SeatNum = @MySeat;
+                UPDATE dbo.TexasHoldEm_Players SET PlayerName = @PlayerName WHERE SeatNum = @MySeat;
+            END
+        END
+
         /* Once the seat is resolved, the seat's name is THE name - always.
            Otherwise a seated player could pass somebody else's @PlayerName
-           and have the log narrate their bets under the victim's name. */
+           and have the log narrate their bets under the victim's name. This
+           also re-syncs @PlayerName after a rename above (or reverts it if
+           the rename was rejected). */
         IF @MySeat IS NOT NULL
             SELECT @PlayerName = PlayerName FROM dbo.TexasHoldEm_Players WHERE SeatNum = @MySeat;
+
+        /* Checking in while queued? Recognize a repeat call the same way a
+           seated player is recognized: by session first, then by name+password
+           if the original session died. Otherwise re-running the same command
+           to check status would just keep adding duplicate waitlist entries. */
+        SET @WaitId = NULL; SET @MyReservedSeat = NULL;
+        IF @MySeat IS NULL
+        BEGIN
+            SELECT @WaitId = WaitId, @MyReservedSeat = ReservedSeat FROM dbo.TexasHoldEm_Waitlist
+             WHERE SessionId = @@SPID AND SessionLoginTime = @MyLoginTime;
+            IF @WaitId IS NULL AND @PlayerName IS NOT NULL
+               AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
+            BEGIN
+                SET @CurOwner = NULL; SET @SeatSalt = NULL; SET @SeatHash = NULL;
+                SELECT @WaitId = WaitId, @CurOwner = SessionId, @MyReservedSeat = ReservedSeat,
+                       @SeatSalt = PasswordSalt, @SeatHash = PasswordHash
+                  FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName;
+                IF @WaitId IS NOT NULL
+                BEGIN
+                    IF @SeatHash IS NOT NULL AND @SeatPassword IS NOT NULL
+                       AND @SeatHash = HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword))
+                        UPDATE dbo.TexasHoldEm_Waitlist
+                           SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime
+                         WHERE WaitId = @WaitId;
+                    ELSE
+                    BEGIN
+                        SET @Notice = CASE
+                            WHEN @SeatHash IS NULL THEN
+                                 N'That name''s already on the waitlist, and it has no @SeatPassword, so it can''t be reclaimed. Pick a different name.'
+                            ELSE N'That name''s already on the waitlist. If it''s you, pass the right @SeatPassword; if it isn''t, pick a different name.'
+                            END;
+                        SET @WaitId = NULL;
+                        SET @ReturnNow = 1;
+                    END
+                END
+            END
+            IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @Action = N'Leave'
+            BEGIN
+                /* A queued human can bail too - otherwise an abandoned entry
+                   sits on one of the four waitlist slots until it's promoted
+                   or the whole table gets swept. */
+                DELETE dbo.TexasHoldEm_Waitlist WHERE WaitId = @WaitId;
+                SET @Notice = N'You''re off the waitlist. Thanks for your patience!';
+                SET @LeftTable = 1;
+                SET @ReturnNow = 1;
+            END
+            ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @MyReservedSeat IS NOT NULL
+            BEGIN
+                SET @Notice = N'Your seat is reserved - a robot is giving it up at the end of the current hand. Run EXEC sp_TexasHoldEm_Public again in a bit to sit down.';
+                SET @ReturnNow = 1;
+            END
+            ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0
+            BEGIN
+                SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId AND ReservedSeat IS NULL;
+                SET @Notice = CONCAT(N'Still on the waitlist, #', @WaitPos,
+                    N' in line for a seat. Run EXEC sp_TexasHoldEm_Public again in a bit',
+                    N', or EXEC sp_TexasHoldEm_Public @Action = ''Leave'' to give up your spot.');
+                SET @ReturnNow = 1;
+            END
+        END
 
         IF @Action = N'Watch' AND @MySeat IS NULL SET @IsObserver = 1;
         IF @Action = N'Status' SET @ReturnNow = 1;
 
-        /* Take a seat if there's room; otherwise you're on the rail. */
+        /* Take a seat if there's room; otherwise queue up or watch from the rail. */
         IF @MySeat IS NULL AND @IsObserver = 0 AND @ReturnNow = 0
         BEGIN
-            IF @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave')
+            IF @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave')
             BEGIN
                 SET @Notice = N'You''re not seated at this table, so you can''t do that. Run EXEC sp_TexasHoldEm_Public to join.';
                 SET @ReturnNow = 1;
             END
-            ELSE IF (SELECT COUNT(*) FROM dbo.TexasHoldEm_Players) >= @MaxSeats
-            BEGIN
-                SET @IsObserver = 1;
-                SET @Notice = CONCAT(N'The table''s full (', @MaxSeats,
-                    N' seats). You''re watching from the rail - you''ll see everything the public sees.');
-            END
             ELSE
             BEGIN
-                IF @PlayerName IS NULL
+                /* Before deciding whether there's room for ME, give any
+                   reserved-or-queued human first crack at a seat that's
+                   already sitting empty - a chair emptying out between
+                   hands doesn't wait for the next deal to be claimed, and
+                   it never goes to a brand-new arrival ahead of someone
+                   already promised it or already in line. Bots are NOT
+                   added here - that stays a hand-boundary thing, so a plain
+                   join attempt can't spawn a robot early. */
+                DELETE @Promoted;
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+                SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                FROM dbo.TexasHoldEm_Waitlist w
+                WHERE w.ReservedSeat IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
+
+                ;WITH freeseats AS (
+                    SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
+                    FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
+                    WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
+                      AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
+                waiters AS (
+                    SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+                           rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
+                    FROM dbo.TexasHoldEm_Waitlist w
+                    WHERE w.ReservedSeat IS NULL)
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+                SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                FROM freeseats f JOIN waiters w ON w.rn = f.rn;
+
+                IF EXISTS (SELECT 1 FROM @Promoted)
                 BEGIN
-                    SET @PlayerName = CONCAT(N'Player ', @@SPID);
-                    /* Session ids recycle, so "Player 57" may already be
-                       seated. Don't collide with them. */
-                    IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
-                        SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
-                            100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
+                    INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
+                                                    PasswordSalt, PasswordHash, IsBot, Chips)
+                    SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, @StartingChips
+                    FROM @Promoted;
+
+                    DELETE dbo.TexasHoldEm_Waitlist WHERE WaitId IN (SELECT WaitId FROM @Promoted);
+
+                    INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                    SELECT g.HandNumber, CONCAT(pr.PlayerName, N' is off the waitlist and sits down with ', @StartingChips, N' chips.')
+                    FROM @Promoted pr CROSS JOIN dbo.TexasHoldEm_Game g;
                 END
-                SELECT TOP (1) @MySeat = v.SeatNum
-                FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
-                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
-                ORDER BY v.SeatNum;
 
-                SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
-                SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
-                     THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                IF (SELECT COUNT(*) FROM dbo.TexasHoldEm_Players) >= @MaxSeats
+                BEGIN
+                    /* Full table, but robots don't get to keep a human out. Bump
+                       one. Mid-hand a robot has chips in the pot and a row the
+                       engine is still reading, so we never delete it out from
+                       under a live hand - we flag it to cash out at the end and
+                       put the human on the rail for one hand. Between hands
+                       there's nothing at stake, so the seat changes hands right
+                       now, and execution falls through to the ordinary
+                       seat-assignment block below (a chair just opened). */
+                    SET @BumpSeat = NULL; SET @BumpName = NULL;
+                    SELECT TOP (1) @BumpSeat = SeatNum, @BumpName = PlayerName
+                    FROM dbo.TexasHoldEm_Players
+                    WHERE IsBot = 1 AND WantsToLeave = 0
+                    ORDER BY Chips, SeatNum;      /* the shortest stack goes first */
 
-                INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
-                                                PasswordSalt, PasswordHash, IsBot, Chips)
-                VALUES (@MySeat, @PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, 0, @StartingChips);
+                    IF @BumpSeat IS NOT NULL AND (SELECT GameState FROM dbo.TexasHoldEm_Game) = 'InHand'
+                    BEGIN
+                        UPDATE dbo.TexasHoldEm_Players SET WantsToLeave = 1 WHERE SeatNum = @BumpSeat;
+                        INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                        SELECT HandNumber, CONCAT(@BumpName, N' is cashing out after this hand to free up a seat for a human.')
+                        FROM dbo.TexasHoldEm_Game;
 
-                /* If the waiting table had emptied out, this player is opening
-                   a fresh lobby and should get the full join window. */
-                IF (SELECT COUNT(*) FROM dbo.TexasHoldEm_Players) = 1
-                   AND (SELECT GameState FROM dbo.TexasHoldEm_Game) = 'WaitingForPlayers'
-                    UPDATE dbo.TexasHoldEm_Game
-                       SET JoinWindowEndsAt = DATEADD(second, @JoinWindowSeconds, SYSDATETIME());
+                        /* Reserve that exact seat right now - a promise with
+                           nothing behind it is just a race. Without this, a
+                           different arrival (or an already-waitlisted human)
+                           could claim the seat the moment it actually frees. */
+                        IF @PlayerName IS NULL
+                        BEGIN
+                            SET @PlayerName = CONCAT(N'Player ', @@SPID);
+                            IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
+                               OR EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                                SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
+                                    100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
+                        END
+                        ELSE IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                        BEGIN
+                            SET @Notice = N'That name''s already on the waitlist. Pick a different one.';
+                            SET @ReturnNow = 1;
+                        END
 
-                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
-                SELECT HandNumber,
-                       CASE WHEN GameState = 'WaitingForPlayers'
-                            THEN CONCAT(@PlayerName, N' joins the game with ', @StartingChips, N' chips.')
-                            ELSE CONCAT(@PlayerName, N' sits down with ', @StartingChips,
-                                 N' chips and will be dealt into the next hand.') END
-                FROM dbo.TexasHoldEm_Game;
+                        IF @ReturnNow = 0
+                        BEGIN
+                            SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                            SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                 THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
 
-                SET @Notice = CASE WHEN @SeatHash IS NOT NULL
-                     THEN N'Seat protected. If you lose this session, reconnect from any window with your @PlayerName and @SeatPassword.'
-                     ELSE N'Heads up: you joined without a @SeatPassword, so if this session dies, your seat (and chips) can''t be reclaimed.' END;
+                            INSERT dbo.TexasHoldEm_Waitlist (PlayerName, SessionId, SessionLoginTime,
+                                                             PasswordSalt, PasswordHash, ReservedSeat)
+                            VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, @BumpSeat);
+
+                            SET @IsObserver = 1;
+                            SET @Notice = CONCAT(@BumpName, N' is giving up their seat for you at the end of this hand - it''s reserved. Watching from the rail until then - run EXEC sp_TexasHoldEm_Public again to sit down.');
+                        END
+                    END
+                    ELSE IF @BumpSeat IS NOT NULL
+                    BEGIN
+                        INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                        SELECT HandNumber, CONCAT(@BumpName, N' gives up a seat to a human and heads for the bar.')
+                        FROM dbo.TexasHoldEm_Game;
+                        DELETE dbo.TexasHoldEm_Players WHERE SeatNum = @BumpSeat;
+                    END
+                    ELSE
+                    BEGIN
+                        /* No robot to bump: the table's full of humans. Queue up
+                           instead of turning you away outright - up to
+                           @MaxWaitlist more humans can wait for the next chair. */
+                        SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist;
+                        IF @WaitPos >= @MaxWaitlist
+                        BEGIN
+                            SET @IsObserver = 1;
+                            SET @Notice = CONCAT(N'The table (', @MaxSeats, N' seats) and the waitlist (', @MaxWaitlist,
+                                N' spots) are both full - ', @MaxHumans, N' humans are already in this game. Watching from the rail.');
+                        END
+                        ELSE
+                        BEGIN
+                            IF @PlayerName IS NULL
+                            BEGIN
+                                SET @PlayerName = CONCAT(N'Player ', @@SPID);
+                                IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
+                                   OR EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                                    SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
+                                        100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
+                            END
+                            ELSE IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                            BEGIN
+                                SET @Notice = N'That name''s already on the waitlist. Pick a different one.';
+                                SET @ReturnNow = 1;
+                            END
+
+                            IF @ReturnNow = 0
+                            BEGIN
+                                SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                                SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                     THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+
+                                INSERT dbo.TexasHoldEm_Waitlist (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+                                VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash);
+                                SET @WaitId = SCOPE_IDENTITY();
+
+                                SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId;
+                                SET @Notice = CONCAT(N'The table''s full. You''re #', @WaitPos, N' on the waitlist',
+                                    CASE WHEN @SeatHash IS NOT NULL THEN N' (protected with your @SeatPassword). ' ELSE N'. ' END,
+                                    N'Run EXEC sp_TexasHoldEm_Public again in a bit to check for an open seat.');
+                                SET @ReturnNow = 1;
+                            END
+                        END
+                    END
+                END
+
+                IF @MySeat IS NULL AND @IsObserver = 0 AND @ReturnNow = 0
+                BEGIN
+                    /* A chair's actually open right now - either it always was,
+                       or a robot just gave one up above. */
+                    IF @PlayerName IS NULL
+                    BEGIN
+                        SET @PlayerName = CONCAT(N'Player ', @@SPID);
+                        /* Session ids recycle, so "Player 57" may already be
+                           seated or waiting. Don't collide with them. */
+                        IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
+                           OR EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                            SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
+                                100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
+                    END
+                    ELSE IF EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                    BEGIN
+                        SET @Notice = N'That name''s on the waitlist. Pick a different one, or wait your turn.';
+                        SET @ReturnNow = 1;
+                    END
+
+                    IF @ReturnNow = 0
+                    BEGIN
+                        SELECT TOP (1) @MySeat = v.SeatNum
+                        FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
+                        WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
+                        ORDER BY v.SeatNum;
+
+                        SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                        SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                             THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+
+                        INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
+                                                        PasswordSalt, PasswordHash, IsBot, Chips)
+                        VALUES (@MySeat, @PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, 0, @StartingChips);
+
+                        /* If the waiting table had emptied out, this player is
+                           opening a fresh lobby and should get the full join
+                           window. */
+                        IF (SELECT COUNT(*) FROM dbo.TexasHoldEm_Players) = 1
+                           AND (SELECT GameState FROM dbo.TexasHoldEm_Game) = 'WaitingForPlayers'
+                            UPDATE dbo.TexasHoldEm_Game
+                               SET JoinWindowEndsAt = DATEADD(second, @JoinWindowSeconds, SYSDATETIME());
+
+                        INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                        SELECT HandNumber,
+                               CASE WHEN GameState = 'WaitingForPlayers'
+                                    THEN CONCAT(@PlayerName, N' joins the game with ', @StartingChips, N' chips.')
+                                    ELSE CONCAT(@PlayerName, N' sits down with ', @StartingChips,
+                                         N' chips and will be dealt into the next hand.') END
+                        FROM dbo.TexasHoldEm_Game;
+
+                        SET @Notice = CASE WHEN @SeatHash IS NOT NULL
+                             THEN N'Seat protected. If you lose this session, reconnect from any window with your @PlayerName and @SeatPassword.'
+                             ELSE N'Heads up: you joined without a @SeatPassword, so if this session dies, your seat (and chips) can''t be reclaimed.' END;
+                    END
+                END
             END
         END
 
         /* Apply a betting action. */
-        IF @MySeat IS NOT NULL AND @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold')
+        IF @MySeat IS NOT NULL AND @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold')
         BEGIN
             SELECT @GState = GameState, @TurnSeat = TurnSeat, @BetToCall = BetToCall,
                    @RaiseCount = RaiseCount, @Round = BettingRound, @GHand = HandNumber
@@ -629,12 +926,17 @@ BEGIN
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @RaiseCount >= @MaxRaises
                 BEGIN
-                    SET @Notice = N'Betting''s capped this round - you can Call or Fold.';
+                    SET @Notice = N'Betting''s capped this round - you can Call, go AllIn, or Fold.';
                     SET @ReturnNow = 1;
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @MyChips < (@NewBet - @MyBet)
                 BEGIN
-                    SET @Notice = N'Not enough chips to raise. You can Call (all in if needed) or Fold.';
+                    SET @Notice = N'Not enough chips to raise. You can Call, go AllIn, or Fold.';
+                    SET @ReturnNow = 1;
+                END
+                ELSE IF @Action = N'AllIn' AND @MyChips <= 0
+                BEGIN
+                    SET @Notice = N'You''re already all in. Enjoy the ride.';
                     SET @ReturnNow = 1;
                 END
                 ELSE
@@ -663,6 +965,32 @@ BEGIN
                         VALUES (@GHand, CONCAT(@PlayerName, N' calls ', @Pay,
                                 CASE WHEN @MyChips <= @Owed THEN N' and is ALL IN.' ELSE N'.' END));
                     END
+                    ELSE IF @Action = N'AllIn'
+                    BEGIN
+                        SET @Pay = @MyChips;
+                        SET @AllInTo = @MyBet + @Pay;   /* total wager this round */
+                        UPDATE dbo.TexasHoldEm_Players
+                           SET Chips = 0, BetThisRound = @AllInTo, AllIn = 1,
+                               NeedsToAct = 0, TimeoutStrikes = 0
+                         WHERE SeatNum = @MySeat;
+                        /* A shove that beats the current bet puts everyone back to work.
+                           Real poker wouldn't reopen betting for an undersized raise;
+                           this table isn't that fussy, and it ignores the raise cap too. */
+                        IF @AllInTo > @BetToCall
+                        BEGIN
+                            UPDATE dbo.TexasHoldEm_Players SET NeedsToAct = 1
+                             WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND SeatNum <> @MySeat;
+                            UPDATE dbo.TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
+                        END
+                        INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                        VALUES (@GHand, CASE
+                                WHEN @AllInTo > @BetToCall
+                                    THEN CONCAT(@PlayerName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                                WHEN @AllInTo = @BetToCall
+                                    THEN CONCAT(@PlayerName, N' calls ALL IN for ', @Pay, N'.')
+                                ELSE CONCAT(@PlayerName, N' calls ALL IN for ', @Pay,
+                                            N', which doesn''t cover the ', @BetToCall, N'.') END);
+                    END
                     ELSE /* Bet / Raise */
                     BEGIN
                         SET @Pay = @NewBet - @MyBet;
@@ -688,8 +1016,10 @@ BEGIN
             END
         END
 
-        /* Cash out. */
-        IF @Action = N'Leave'
+        /* Cash out. Skipped if @ReturnNow is already 1 - a waitlisted Leave
+           was just handled above, and this generic "you weren't seated"
+           branch would otherwise stomp that notice right back off. */
+        IF @Action = N'Leave' AND @ReturnNow = 0
         BEGIN
             IF @MySeat IS NULL
                 SET @Notice = N'You weren''t seated anyway. Easiest fold of your life.';
@@ -764,26 +1094,8 @@ BEGIN
         IF @GState = 'WaitingForPlayers'
         BEGIN
             SELECT @NumPlayers = COUNT(*) FROM dbo.TexasHoldEm_Players;
-            IF @NumPlayers = 0 BREAK;
+            IF @NumPlayers = 0 AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist) BREAK;
             IF SYSDATETIME() < @JoinEnds AND @NumPlayers < @MaxSeats BREAK;
-
-            IF @NumPlayers = 1
-            BEGIN
-                /* Nobody came. Release the robots. */
-                ;WITH freeseats AS (
-                    SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
-                    FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
-                    WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)),
-                bots AS (
-                    SELECT b.BotName, rn = ROW_NUMBER() OVER (ORDER BY b.SortOrder)
-                    FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName))
-                INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
-                SELECT f.SeatNum, b.BotName, 0, 1, @StartingChips
-                FROM freeseats f JOIN bots b ON b.rn = f.rn;
-
-                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
-                VALUES (@GHand, N'Nobody else joined, so the robots are sitting in: Clippy, HAL, and Bender. Good luck.');
-            END
             SET @StartHandNow = 1;
         END
 
@@ -795,6 +1107,72 @@ BEGIN
 
         IF @StartHandNow = 1
         BEGIN
+            /* Before every hand (not just the first one): honor any seat
+               reservations first (a robot got bumped mid-hand and promised
+               its chair to a specific human - see the bump branch above),
+               then pull whoever's waited longest in the general FIFO line
+               into whatever's still empty, then fill the rest with robots
+               so the table always plays full. Robots are seat-warmers, not
+               regulars - the next human to walk up takes a robot's chair
+               instead of going to the rail. */
+            DELETE @Promoted;
+            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+            SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+            FROM dbo.TexasHoldEm_Waitlist w
+            WHERE w.ReservedSeat IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
+
+            ;WITH freeseats AS (
+                SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
+                FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
+                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
+                  AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
+            waiters AS (
+                SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+                       rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
+                FROM dbo.TexasHoldEm_Waitlist w
+                WHERE w.ReservedSeat IS NULL)   /* reserved rows are handled above, on their own seat only */
+            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
+            SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+            FROM freeseats f JOIN waiters w ON w.rn = f.rn;
+
+            IF EXISTS (SELECT 1 FROM @Promoted)
+            BEGIN
+                INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
+                                                PasswordSalt, PasswordHash, IsBot, Chips)
+                SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, @StartingChips
+                FROM @Promoted;
+
+                DELETE dbo.TexasHoldEm_Waitlist WHERE WaitId IN (SELECT WaitId FROM @Promoted);
+
+                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                SELECT @GHand, CONCAT(PlayerName, N' is off the waitlist and sits down with ', @StartingChips, N' chips.')
+                FROM @Promoted;
+            END
+
+            ;WITH freeseats AS (
+                SELECT v.SeatNum, rn = ROW_NUMBER() OVER (ORDER BY v.SeatNum)
+                FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
+                WHERE NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)),
+            bots AS (
+                SELECT b.BotName, rn = ROW_NUMBER() OVER (ORDER BY b.SortOrder)
+                FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName))
+            INSERT dbo.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
+            SELECT f.SeatNum, b.BotName, 0, 1, @StartingChips
+            FROM freeseats f JOIN bots b ON b.rn = f.rn;
+            SET @BotsAdded = @@ROWCOUNT;
+
+            IF @BotsAdded > 0
+            BEGIN
+                SET @Msg = NULL;
+                SELECT @Msg = STRING_AGG(PlayerName, N', ') WITHIN GROUP (ORDER BY SeatNum)
+                FROM dbo.TexasHoldEm_Players WHERE IsBot = 1;
+                IF @Msg IS NOT NULL
+                    INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                    VALUES (@GHand, CONCAT(N'Filling the empty seats with robots: ', @Msg,
+                            N'. They''ll give up a chair when a human wants one. Good luck.'));
+            END
+
             /* ===== Start a new hand: button, blinds, shuffle, deal. ===== */
             SET @PrevDealer = ISNULL(@Dealer, 0);
             SET @GHand += 1;
@@ -915,7 +1293,30 @@ BEGIN
         ELSE IF NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Players
                             WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND NeedsToAct = 1)
         BEGIN
-            /* Betting round complete: sweep the bets into the pot. */
+            /* Betting round complete. First, hand back an uncalled bet: if one
+               player wagered more this round than anybody else could match -
+               the usual way to shove into a shorter stack - the excess is theirs.
+               This table has no side pots, so without this the overage would just
+               evaporate into a pot they can't win back. */
+            SET @TopBet = NULL; SET @NextBet = NULL; SET @RefundSeat = NULL;
+            SELECT TOP (1) @RefundSeat = SeatNum, @TopBet = BetThisRound
+            FROM dbo.TexasHoldEm_Players WHERE InHand = 1 ORDER BY BetThisRound DESC, SeatNum;
+            SELECT @NextBet = ISNULL(MAX(BetThisRound), 0)
+            FROM dbo.TexasHoldEm_Players WHERE InHand = 1 AND SeatNum <> @RefundSeat;
+            SET @Refund = ISNULL(@TopBet, 0) - ISNULL(@NextBet, 0);
+            IF @Refund > 0
+            BEGIN
+                UPDATE dbo.TexasHoldEm_Players
+                   SET Chips = Chips + @Refund, BetThisRound = BetThisRound - @Refund,
+                       AllIn = CASE WHEN Chips + @Refund > 0 THEN 0 ELSE AllIn END
+                 WHERE SeatNum = @RefundSeat;
+                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                SELECT @GHand, CONCAT(N'Nobody could cover it all, so ', PlayerName, N' takes back ',
+                       @Refund, N' in uncalled chips.')
+                FROM dbo.TexasHoldEm_Players WHERE SeatNum = @RefundSeat;
+            END
+
+            /* Now sweep what's left into the pot. */
             SELECT @RoundBets = ISNULL(SUM(BetThisRound), 0) FROM dbo.TexasHoldEm_Players WHERE InHand = 1;
             UPDATE dbo.TexasHoldEm_Players SET BetThisRound = 0 WHERE InHand = 1;
             SET @Pot += @RoundBets;
@@ -1155,18 +1556,21 @@ BEGIN
                    @HumansLeft = ISNULL(SUM(CASE WHEN IsBot = 0 THEN 1 ELSE 0 END), 0)
             FROM dbo.TexasHoldEm_Players;
 
-            IF @NumPlayers = 0
+            /* None of these endings should strand somebody on the waitlist -
+               a person still queued for a seat means the game isn't really
+               over, it just needs one more hand-start to pull them in. */
+            IF @NumPlayers = 0 AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT dbo.TexasHoldEm_Log (HandNumber, Message) VALUES (@GHand, N'Everyone''s gone home. GAME OVER.');
                 UPDATE dbo.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @HumansLeft = 0
+            ELSE IF @HumansLeft = 0 AND @NumPlayers > 0 AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, N'No humans remain. The machines win. GAME OVER.');
                 UPDATE dbo.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @NumPlayers = 1
+            ELSE IF @NumPlayers = 1 AND NOT EXISTS (SELECT 1 FROM dbo.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
                 SELECT @GHand, CONCAT(N'*** ', PlayerName, N' WINS IT ALL with ', Chips, N' chips! GAME OVER. ***')
@@ -1188,7 +1592,9 @@ BEGIN
         /* ===== Somebody owes the table a decision. ===== */
         SET @ActorSeat = NULL;
         SELECT @ActorSeat = SeatNum, @ActorBot = IsBot, @ActorName = PlayerName,
-               @ActorChips = Chips, @ActorBet = BetThisRound, @ActorStrikes = TimeoutStrikes
+               @ActorChips = Chips, @ActorBet = BetThisRound, @ActorStrikes = TimeoutStrikes,
+               /* CardId 0-51 encodes rank as CardId / 4 + 2 - see the #Cards deck above. */
+               @ActorRank1 = Card1 / 4 + 2, @ActorRank2 = Card2 / 4 + 2
         FROM dbo.TexasHoldEm_Players
         WHERE SeatNum = @TurnSeat AND InHand = 1 AND Folded = 0 AND AllIn = 0 AND NeedsToAct = 1;
 
@@ -1209,23 +1615,49 @@ BEGIN
 
         IF @ActorBot = 1
         BEGIN
-            /* The robot "brain": mostly calls, sometimes raises, occasionally
-               remembers it has feelings and folds. Do not study this for GTO. */
+            /* The robot "brain": it actually looks at its hole cards now. Pairs and
+               big cards get raised, junk gets folded when it's facing a bet, and the
+               dice decide the rest so the table stays unpredictable. Still not GTO. */
             SET @r = ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 100;
-            IF @Owed <= 0
+            /* Fixed-limit table: a raise needs an open raise slot and the chips to make it. */
+            SET @CanRaise = CASE WHEN @RaiseCount < @MaxRaises AND @ActorChips >= (@NewBet - @ActorBet)
+                                 THEN 1 ELSE 0 END;
+            /* Shoving is only for short stacks. This is a LIMIT table with 50 big
+               bets in front of everyone at the start, so a robot that jams its whole
+               stack on hand one just ends the game. A stack only goes in when the
+               fixed-limit bets can't get it in anyway: desperation under two bets,
+               or a monster under five. @r is 0-99, so "@r < 45" is a 45% chance. */
+            SET @Shove = CASE WHEN @ActorChips > 0
+                               AND ((@ActorChips <= 2 * @Unit AND @r < 45)
+                                    OR (@ActorChips <= 5 * @Unit
+                                        AND @ActorRank1 = @ActorRank2 AND @ActorRank1 >= 12
+                                        AND @r < 60))
+                              THEN 1 ELSE 0 END;
+
+            IF @Owed > 0
             BEGIN
-                IF @r < 70 OR @RaiseCount >= @MaxRaises OR @ActorChips < (@NewBet - @ActorBet)
-                    SET @BotMove = 'Check';
-                ELSE
+                /* Junk hands, and bets that cost more than a third of the stack, get away. */
+                IF (@ActorRank1 <> @ActorRank2 AND @ActorRank1 < 10 AND @ActorRank2 < 10 AND @r < 22)
+                   OR (@Owed > (@ActorChips / 3) AND @r < 35)
+                    SET @BotMove = 'Fold';
+                ELSE IF @Shove = 1
+                    SET @BotMove = 'AllIn';
+                ELSE IF (@ActorRank1 = @ActorRank2 OR @ActorRank1 >= 12 OR @ActorRank2 >= 12)
+                     AND @r >= 82 AND @CanRaise = 1
                     SET @BotMove = 'Raise';
+                ELSE
+                    SET @BotMove = 'Call';
             END
             ELSE
             BEGIN
-                IF @r < 55 SET @BotMove = 'Call';
-                ELSE IF @r < 78 AND @RaiseCount < @MaxRaises AND @ActorChips >= (@NewBet - @ActorBet)
+                /* Nothing to call: bet the premium hands, plus the occasional bluff. */
+                IF @Shove = 1
+                    SET @BotMove = 'AllIn';
+                ELSE IF (@ActorRank1 = @ActorRank2 OR @ActorRank1 >= 13 OR @ActorRank2 >= 13 OR @r >= 80)
+                     AND @CanRaise = 1
                     SET @BotMove = 'Raise';
-                ELSE IF @r < 82 SET @BotMove = 'Call';
-                ELSE SET @BotMove = 'Fold';
+                ELSE
+                    SET @BotMove = 'Check';
             END
 
             IF @BotMove = 'Check'
@@ -1243,6 +1675,28 @@ BEGIN
                 INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, CONCAT(@ActorName, N' calls ', @Pay,
                         CASE WHEN @ActorChips <= @Owed THEN N' and is ALL IN.' ELSE N'.' END));
+            END
+            ELSE IF @BotMove = 'AllIn'
+            BEGIN
+                SET @Pay = @ActorChips;
+                SET @AllInTo = @ActorBet + @Pay;
+                UPDATE dbo.TexasHoldEm_Players
+                   SET Chips = 0, BetThisRound = @AllInTo, AllIn = 1, NeedsToAct = 0
+                 WHERE SeatNum = @ActorSeat;
+                IF @AllInTo > @BetToCall
+                BEGIN
+                    UPDATE dbo.TexasHoldEm_Players SET NeedsToAct = 1
+                     WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND SeatNum <> @ActorSeat;
+                    UPDATE dbo.TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
+                END
+                INSERT dbo.TexasHoldEm_Log (HandNumber, Message)
+                VALUES (@GHand, CASE
+                        WHEN @AllInTo > @BetToCall
+                            THEN CONCAT(@ActorName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
+                        WHEN @AllInTo = @BetToCall
+                            THEN CONCAT(@ActorName, N' calls ALL IN for ', @Pay, N'.')
+                        ELSE CONCAT(@ActorName, N' calls ALL IN for ', @Pay,
+                                    N', which doesn''t cover the ', @BetToCall, N'.') END);
             END
             ELSE IF @BotMove = 'Raise'
             BEGIN
@@ -1379,11 +1833,10 @@ BEGIN
         SET @CardsShownForHand = @GHand;
     END
 
-    IF @Notice IS NOT NULL
-    BEGIN
-        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
-        SET @Notice = NULL;
-    END
+    /* Hang onto the notice. If this pass turns out to be the one that hands
+       results back, the severity-11 raise at the very bottom delivers it and
+       drags SSMS over to the Messages tab. */
+    IF @Notice IS NOT NULL SET @LastNotice = @Notice;
 
     /* Is there a reason to give this session its results back? */
     IF @ReturnNow = 1 BREAK;
@@ -1402,6 +1855,15 @@ BEGIN
     BEGIN
         SET @GaveUp = 1;
         BREAK;
+    END
+
+    /* Still waiting, so say it now rather than making them wait for the
+       end-of-proc raise - and clear it, since they've now seen it. */
+    IF @Notice IS NOT NULL
+    BEGIN
+        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
+        SET @Notice = NULL;
+        SET @LastNotice = NULL;
     END
 
     IF @ToldWaiting = 0
@@ -1542,6 +2004,13 @@ BEGIN
             (CONCAT(N'EXEC sp_TexasHoldEm_Public @Action = ''Raise''', @NameArg, N';',
                     CASE WHEN @BetToCall = 0 THEN N'   -- bet ' ELSE N'   -- raise to ' END, @NewBet));
 
+    /* The shove is always on the menu - the raise cap doesn't apply to it, and
+       this includes an exact or short all-in call, not just a raise-sized one. */
+    IF @MyChips > 0
+        INSERT @Prompt (Line) VALUES
+            (CONCAT(N'EXEC sp_TexasHoldEm_Public @Action = ''AllIn''', @NameArg, N';',
+                    N'   -- shove all ', @MyChips, N', for a total of ', @MyBet + @MyChips, N' this round'));
+
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'EXEC sp_TexasHoldEm_Public @Action = ''Fold''', @NameArg, N';'));
 
@@ -1614,13 +2083,25 @@ BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK;
     THROW;
 END CATCH
+
+/* SSMS focuses the Results grid whenever a query returns one, and this proc
+   always returns one, so whatever we said in the Messages tab gets buried the
+   moment the query finishes. Severity 11+ is the only thing that pulls focus
+   back there, so when the player needs to READ something - a rejected action,
+   a "not your turn" - we hand it back as an error on the way out. Severity 11
+   doesn't abort the batch and leaves SQLCMD's exit code at 0; it just turns
+   the text red and wins the argument about which tab you're looking at. This
+   lives after END CATCH on purpose: raised inside the TRY, the CATCH above
+   would swallow it and roll the game back. */
+IF @LastNotice IS NOT NULL
+    RAISERROR(N'%s', 11, 1, @LastNotice);
 END
 GO
 
 /* Quick demo:
 
    Window 1:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Brent', @SeatPassword = 'hunter2';
-   Window 2:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Erika', @SeatPassword = 'yeehaw';   (within 60 seconds)
+   Window 2:  EXEC sp_TexasHoldEm_Public @PlayerName = 'Claude', @SeatPassword = 'yeehaw';   (within 60 seconds)
    Window 3:  EXEC sp_TexasHoldEm_Public @Action = 'Status';      (instant peek, never blocks)
 
    Then just do what the [What Now] result set tells you. If a window dies,

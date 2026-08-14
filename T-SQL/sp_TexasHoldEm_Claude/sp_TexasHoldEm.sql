@@ -11,7 +11,7 @@ How to play:
      (@PlayerName is optional - you'll get a name like "Player 57" - but a
      name lets you reconnect from a new session and reclaim your seat.)
 
-  3. In other windows/sessions:   EXEC sp_TexasHoldEm @PlayerName = 'Erika';
+  3. In other windows/sessions:   EXEC sp_TexasHoldEm @PlayerName = 'Claude';
      Up to 4 seats. If nobody else joins within 60 seconds, you play against
      three robots: Clippy, HAL, and Bender. If the table's full, you watch
      from the rail as an observer and see what the public sees.
@@ -1384,7 +1384,7 @@ GO
 /* Quick demo:
 
    Window 1:  EXEC sp_TexasHoldEm @PlayerName = 'Brent';
-   Window 2:  EXEC sp_TexasHoldEm @PlayerName = 'Erika';   (within 60 seconds)
+   Window 2:  EXEC sp_TexasHoldEm @PlayerName = 'Claude';   (within 60 seconds)
    Window 3:  EXEC sp_TexasHoldEm @Action = 'Status';      (instant peek, never blocks)
 
    Then just do what the [What Now] result set tells you.
