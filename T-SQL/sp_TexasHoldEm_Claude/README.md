@@ -104,9 +104,10 @@ hostile and fluent in T-SQL — and changes the design accordingly:
   `TexasHoldEm_Public` schema, created by an admin. Hole-card identifiers are
   encrypted at rest and decrypted only in authorized paths inside the
   certificate-signed procedure. The dedicated player role can execute the
-  procedure but is explicitly denied direct access to the schema and
-  certificate. No card peeking, chip forging, or dropping the casino — and
-  the game survives disconnects, so nobody's session is load-bearing anymore.
+  procedure, is explicitly denied direct access to the schema, and receives
+  no certificate permissions. No card peeking, chip forging, or dropping the
+  casino — and the game survives disconnects, so nobody's session is
+  load-bearing anymore.
 - **Seat passwords.** Reclaiming a seat by `@PlayerName` from a new session
   now requires the optional `@SeatPassword` you joined with (salted SHA-256
   in the table). No password, no reclaim, no hijacking someone's stack.
