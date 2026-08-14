@@ -691,8 +691,17 @@ IF @Action = N'Reset'
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
    impersonate other players with, no consecutive spaces to fake a lookalike. */
+/* Every literal leads this bracket list on purpose, dash included. Under a
+   binary collation, SQL Server's LIKE drops a literal underscore or dash
+   from a character class when it trails adjacent A-Z/a-z/0-9 ranges
+   (reproduced directly against the engine), so the old
+   '[^A-Za-z0-9 ._-]' ordering rejected every legitimate name containing
+   either character - exactly the names the message below promises are
+   fine. A '-' immediately after the '^' can't be read as a range
+   boundary, so it is unambiguously literal. This is not cosmetic
+   reordering. */
 IF @PlayerName IS NOT NULL
-   AND (@PlayerName LIKE N'%[^A-Za-z0-9 ._-]%' COLLATE Latin1_General_100_BIN2
+   AND (@PlayerName LIKE N'%[^-_ .A-Za-z0-9]%' COLLATE Latin1_General_100_BIN2
         OR @PlayerName LIKE N'%  %')
 BEGIN
     SELECT [Say What?] = N'Player names here are boring on purpose: up to 30 characters of letters, numbers, single spaces, dots, dashes, and underscores. No emoji, no zero-width shenanigans, no pretending to be somebody else.';
@@ -724,8 +733,18 @@ END
    (permission denied - the healthy state, carry on), while a missing
    table raises error 208 from a lower execution level, which - unlike a
    same-scope compile error - this proc CAN catch and translate. */
+DECLARE @ProbeDummy int;
 BEGIN TRY
-    EXEC sp_executesql N'SELECT TOP (0) 1 FROM TexasHoldEm_Public.TexasHoldEm_Game, TexasHoldEm_Public.TexasHoldEm_Players, TexasHoldEm_Public.TexasHoldEm_Log, TexasHoldEm_Public.TexasHoldEm_Waitlist, TexasHoldEm_Public.TexasHoldEm_Identities;';
+    /* Assign into a variable rather than running a bare SELECT: a bare
+       SELECT here hands the caller a phantom empty result set on EVERY
+       call, ahead of the four documented ones (Hand, Seat, What Now, What
+       Happened), which silently breaks any client that reads result sets
+       by position. TOP (1) keeps the probe from enumerating a five-way
+       unfiltered cross join; the existence and permission checks that make
+       this probe worthwhile still happen regardless of how many rows come
+       back. */
+    EXEC sp_executesql N'SELECT TOP (1) @ProbeDummy = 1 FROM TexasHoldEm_Public.TexasHoldEm_Game, TexasHoldEm_Public.TexasHoldEm_Players, TexasHoldEm_Public.TexasHoldEm_Log, TexasHoldEm_Public.TexasHoldEm_Waitlist, TexasHoldEm_Public.TexasHoldEm_Identities;',
+        N'@ProbeDummy int OUTPUT', @ProbeDummy OUTPUT;
 END TRY
 BEGIN CATCH
     IF ERROR_NUMBER() = 208
@@ -1790,8 +1809,17 @@ BEGIN
                 FROM (VALUES (1),(2),(3),(4)) v(SeatNum)
                 WHERE NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)),
             bots AS (
+                /* Rank only the bot names that AREN'T already at the table.
+                   Robots bust one at a time far more often than all at once,
+                   so ranking all three unconditionally hands the first free
+                   seat to 'Clippy' even when Clippy is still sitting there -
+                   a PlayerName UNIQUE violation that isn't caught anywhere
+                   and aborts the call for every player at the table, not
+                   just the one who triggered the deal. */
                 SELECT b.BotName, rn = ROW_NUMBER() OVER (ORDER BY b.SortOrder)
-                FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName))
+                FROM (VALUES (1, N'Clippy'), (2, N'HAL'), (3, N'Bender')) b(SortOrder, BotName)
+                WHERE NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p
+                                   WHERE p.PlayerName = b.BotName))
             INSERT TexasHoldEm_Public.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
             SELECT f.SeatNum, b.BotName, 0, 1, @StartingChips
             FROM freeseats f JOIN bots b ON b.rn = f.rn;
