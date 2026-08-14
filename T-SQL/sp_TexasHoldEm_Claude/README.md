@@ -76,6 +76,10 @@ The four result sets keep the same order and shape in both modes.
   can buy back in if a seat is open).
 - 60-second shot clock per decision: dawdle and you auto-check or auto-fold.
   Three timeouts and your seat goes to someone with better attendance.
+- After a hand, the final table and transcript remain available until every
+  participating human checks in or a 60-second acknowledgement deadline
+  expires. Disconnected, departed, and busted identities cannot hold the
+  next hand indefinitely.
 - No side pots: you can call all-in for less, and a short-stacked winner
   takes the whole pot. This is a demo, not the WSOP.
 - `@PlayerName` is optional but recommended: it's the key that lets you

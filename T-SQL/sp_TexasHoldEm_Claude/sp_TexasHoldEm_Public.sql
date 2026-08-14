@@ -260,7 +260,22 @@ CREATE TABLE TexasHoldEm_Public.TexasHoldEm_Players (
     BetThisRound int NOT NULL DEFAULT 0,
     NeedsToAct bit NOT NULL DEFAULT 0,
     TimeoutStrikes tinyint NOT NULL DEFAULT 0,
-    WantsToLeave bit NOT NULL DEFAULT 0);
+    WantsToLeave bit NOT NULL DEFAULT 0,
+    LastPlayedHand int NOT NULL
+        CONSTRAINT DF_TexasHoldEm_Players_LastPlayedHand DEFAULT (0),
+    LastViewedHand int NOT NULL
+        CONSTRAINT DF_TexasHoldEm_Players_LastViewedHand DEFAULT (0));
+
+/* Upgrade installations created before per-player showdown acknowledgement. */
+IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastPlayedHand') IS NULL
+    ALTER TABLE TexasHoldEm_Public.TexasHoldEm_Players
+        ADD LastPlayedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Players_LastPlayedHand DEFAULT (0) WITH VALUES;
+
+IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastViewedHand') IS NULL
+    ALTER TABLE TexasHoldEm_Public.TexasHoldEm_Players
+        ADD LastViewedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Players_LastViewedHand DEFAULT (0) WITH VALUES;
 
 /* Humans who showed up after all 4 physical seats (and every robot) were
    already spoken for. First in line gets the next chair that opens - see
@@ -368,7 +383,7 @@ DECLARE @SmallBlind int = 10,
         @JoinWindowSeconds int = 60,
         @TurnSeconds int = 60,       /* the shot clock */
         @MaxTimeoutStrikes int = 3,
-        @BetweenHandsSeconds int = 10,
+        @BetweenHandsSeconds int = 60, /* acknowledgement deadline */
         @MaxWaitMinutes int = 30,    /* give up blocking after this long - waiting queries hold worker threads */
         @AbandonedAfterMinutes int = 30;  /* sweep a table nobody's touched in this long */
 DECLARE @MaxWaitlist int = @MaxHumans - @MaxSeats;
@@ -414,6 +429,7 @@ DECLARE @rc int,
         /* engine workspace */
         @Spins int, @StartHandNow bit, @HandDone bit,
         @NumPlayers int, @HumansLeft int, @NumInHand int, @Unfolded int, @ActiveBettors int,
+        @UnviewedHumans int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
         @ActorRank1 int, @ActorRank2 int, @CanRaise bit, @Shove bit,
@@ -1220,7 +1236,16 @@ BEGIN
 
         IF @GState = 'BetweenHands'
         BEGIN
-            IF SYSDATETIME() < @NextHandAt BREAK;
+            SELECT @UnviewedHumans = COUNT(*)
+            FROM TexasHoldEm_Public.TexasHoldEm_Players
+            WHERE IsBot = 0
+              AND LastPlayedHand = @GHand
+              AND LastViewedHand < @GHand;
+
+            /* Keep the completed table and showdown transcript available
+               until every still-relevant human participant has received it,
+               but never let a disconnected player block beyond the deadline. */
+            IF @UnviewedHumans > 0 AND SYSDATETIME() < @NextHandAt BREAK;
             SET @StartHandNow = 1;
         END
 
@@ -1299,7 +1324,8 @@ BEGIN
             UPDATE TexasHoldEm_Public.TexasHoldEm_Players
                SET InHand = CASE WHEN Chips > 0 THEN 1 ELSE 0 END,
                    Folded = 0, AllIn = 0, BetThisRound = 0, NeedsToAct = 0,
-                   HoleCardsEncrypted = NULL;
+                   HoleCardsEncrypted = NULL,
+                   LastPlayedHand = CASE WHEN IsBot = 0 AND Chips > 0 THEN @GHand ELSE LastPlayedHand END;
 
             SELECT @NumInHand = COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE InHand = 1;
             IF @NumInHand < 2
@@ -1718,8 +1744,8 @@ BEGIN
             ELSE
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-                VALUES (@GHand, CONCAT(N'Next hand in ', @BetweenHandsSeconds,
-                        N' seconds. (If your query already finished, run EXEC sp_TexasHoldEm_Public to keep playing.)'));
+                VALUES (@GHand, CONCAT(N'Waiting for participating humans to receive the result; the next hand starts after everyone checks in or ',
+                        @BetweenHandsSeconds, N' seconds pass.'));
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Game
                    SET GameState = 'BetweenHands', TurnSeat = NULL,
                        NextHandStartsAt = DATEADD(second, @BetweenHandsSeconds, SYSDATETIME());
@@ -1972,6 +1998,17 @@ BEGIN
     INSERT @NewLog (LogId, Message)
     SELECT LogId, Message FROM TexasHoldEm_Public.TexasHoldEm_Log WHERE LogId > @LastLogId;
     SELECT @LastLogId = ISNULL(MAX(LogId), @LastLogId) FROM @NewLog;
+
+    /* A BetweenHands response contains this hand's final table and transcript.
+       Acknowledge only this viewer and only the hand captured above. The next
+       invocation may then advance once every relevant human has checked in. */
+    IF @GState = 'BetweenHands' AND @MySeat IS NOT NULL
+        UPDATE TexasHoldEm_Public.TexasHoldEm_Players
+           SET LastViewedHand = @GHand
+         WHERE SeatNum = @MySeat
+           AND IsBot = 0
+           AND LastPlayedHand = @GHand
+           AND LastViewedHand < @GHand;
 
     COMMIT;
 
