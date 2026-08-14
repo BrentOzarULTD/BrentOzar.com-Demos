@@ -116,10 +116,12 @@ HOW TO PLAY
      query. To see more, pass @ShowWhatHappened:
         'ThisTurn'   - the default: just what you missed since last time.
         'ThisGame'   - every hand of the game currently being played.
-        'AllHistory' - the whole log, all the way back. Bring popcorn.
+        'AllHistory' - all retained log rows since the last RESET or explicit
+                       NEWGAME. Bring popcorn.
 
 Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
-         Status (instant snapshot, never blocks), Help.
+         Status (instant snapshot, never blocks), NewGame (after GAME OVER),
+         Reset (database administrators only), Help. Actions are case-insensitive.
 
 House rules:
   - Fixed-limit Hold 'Em: blinds 10/20, bets 20 pre-flop & flop, 40 on the
@@ -398,6 +400,7 @@ DECLARE @rc int,
         @MyInHand bit,
         @IsObserver bit = 0,
         @ReturnNow bit = 0,
+        @SkipEngine bit = 0,
         @FirstPass bit = 1,
         @ToldWaiting bit = 0,
         @LeftTable bit = 0,
@@ -445,7 +448,8 @@ DECLARE @rc int,
         @Cat bigint, @T1 int, @T2 int, @T3 int, @T4 int, @T5 int,
         @Score bigint, @HandName nvarchar(60),
         @BestScore bigint, @NumWinners int, @Share int, @Rem int,
-        @NameArg nvarchar(80), @SecondsLeft int;
+        @NameArg nvarchar(80), @SecondsLeft int,
+        @LifecycleActor nvarchar(128);
 
 DECLARE @NewLog TABLE (LogId int, Message nvarchar(500));
 DECLARE @Shuffled TABLE (Pos int, CardId tinyint);
@@ -479,13 +483,27 @@ SET @PlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
 SET @SeatPassword = NULLIF(@SeatPassword, N'');
 SET @WaitForTurn = ISNULL(@WaitForTurn, 1);
 SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
-IF @Action = N'Join' SET @Action = NULL;
-/* Nobody types the same thing twice under pressure. Take all of them. */
-IF @Action COLLATE Latin1_General_100_CI_AS IN (N'All In', N'All-In', N'All_In', N'Shove', N'Jam')
-    SET @Action = N'AllIn';
-IF @Action COLLATE Latin1_General_100_CI_AS = N'Status'
+/* Canonical action casing keeps behavior stable on case-sensitive databases.
+   Nobody types ALL IN the same way twice under pressure, so take the common
+   spellings too. */
+SET @Action = CASE
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Join' THEN NULL
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Check' THEN N'Check'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Call' THEN N'Call'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Bet' THEN N'Bet'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Raise' THEN N'Raise'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS IN (N'AllIn', N'All In', N'All-In', N'All_In', N'Shove', N'Jam') THEN N'AllIn'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Fold' THEN N'Fold'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Leave' THEN N'Leave'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Watch' THEN N'Watch'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Status' THEN N'Status'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'NewGame' THEN N'NewGame'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Reset' THEN N'Reset'
+    WHEN @Action COLLATE Latin1_General_100_CI_AS = N'Help' THEN N'Help'
+    ELSE @Action END;
+
+IF @Action = N'Status'
 BEGIN
-    SET @Action = N'Status';
     SET @WaitForTurn = 0;
 END
 
@@ -506,10 +524,10 @@ SET @ShowWhatHappened = CASE
     ELSE N'ThisTurn' END;
 
 IF @Action IS NOT NULL
-   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
+   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave', N'Watch', N'Status', N'NewGame', N'Reset', N'Help')
 BEGIN
     SELECT [Say What?] = CONCAT(N'I don''t know the action ''', @Action,
-        N'''. Try: Join, Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch, Status, or Help.');
+        N'''. Try: Join, Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch, Status, NewGame, Reset, or Help.');
     RETURN;
 END
 
@@ -534,11 +552,17 @@ BEGIN
         (15,N'The query finishes when it''s your turn, and tells you exactly what to run next.'),
         (16,N'Results come back as: Hand, Seat, What Now, What Happened.'),
         (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
-        (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for every hand ever played here.')
+        (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for all retained rows since RESET or explicit NEWGAME.'),
+        (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- start fresh after GAME OVER'),
+        (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table')
         ) v(LineId, Line)
     ORDER BY v.LineId;
     RETURN;
 END
+
+IF @Action = N'Reset'
+   AND ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL'), 0) <> 1
+    THROW 50006, 'RESET is restricted to database administrators.', 1;
 
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
@@ -646,6 +670,55 @@ BEGIN
            instead meant a fresh session opened on the tail of somebody else's
            finished hand. Pass @ShowWhatHappened = 'ThisGame' to see more. */
         SET @TurnStartLogId = ISNULL((SELECT MAX(LogId) FROM TexasHoldEm_Public.TexasHoldEm_Log), 0);
+
+        /* Explicit lifecycle controls run under the same transaction-owned
+           applock as joins and engine work, so reset/join races serialize.
+           Preserve the random applock resource itself; changing it while the
+           old resource is held would split the serialization boundary. */
+        IF @Action = N'NewGame'
+           AND (SELECT GameState FROM TexasHoldEm_Public.TexasHoldEm_Game) <> 'GameOver'
+        BEGIN
+            SET @Notice = N'NEWGAME is available only after GAME OVER. A database administrator can use RESET to abandon the running game.';
+            SET @ReturnNow = 1;
+            SET @SkipEngine = 1;
+        END
+        ELSE IF @Action IN (N'Reset', N'NewGame')
+        BEGIN
+            SET @LifecycleActor = COALESCE(ORIGINAL_LOGIN(), SUSER_SNAME(), USER_NAME(), N'unknown administrator');
+
+            DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Log;
+
+            UPDATE TexasHoldEm_Public.TexasHoldEm_Game
+               SET GameState = 'WaitingForPlayers', HandNumber = 0, DealerSeat = NULL,
+                   SmallBlindSeat = NULL, BigBlindSeat = NULL, BettingRound = NULL,
+                   BoardShown = 0, ShowdownShown = 0,
+                   Board1 = NULL, Board2 = NULL, Board3 = NULL, Board4 = NULL, Board5 = NULL,
+                   Pot = 0, BetToCall = 0, RaiseCount = 0, TurnSeat = NULL, TurnStartedAt = NULL,
+                   JoinWindowEndsAt = DATEADD(second, @JoinWindowSeconds, SYSDATETIME()),
+                   NextHandStartsAt = NULL;
+
+            INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
+            VALUES (0, CONCAT(CASE WHEN @Action = N'Reset' THEN N'Table RESET by ' ELSE N'NEWGAME started by ' END,
+                              @LifecycleActor, N'. A fresh join window is open.'));
+
+            IF @Action = N'Reset'
+            BEGIN
+                SET @Notice = N'The table was reset atomically. A fresh join window is open.';
+                SET @ReturnNow = 1;
+            END
+            ELSE
+            BEGIN
+                /* NEWGAME is also a seat request, matching the legacy
+                   post-game join behavior: the caller enters with a clean
+                   starting stack and receives the lobby response now. */
+                SET @Notice = N'A fresh 1,000-chip game and join window are open.';
+                SET @Action = NULL;
+                SET @WaitForTurn = 0;
+            END
+            SET @SkipEngine = 1;
+        END
 
         /* On a public server, tables get abandoned mid-hand. If nothing has
            happened for a while, sweep the chips and reset rather than making
@@ -1209,7 +1282,7 @@ BEGIN
        is waiting on a live human (or the join clock).
        ================================================================ */
     SET @Spins = 0;
-    WHILE @Spins < 200
+    WHILE @Spins < 200 AND @SkipEngine = 0
     BEGIN
         SET @Spins += 1;
         SET @StartHandNow = 0;
@@ -2211,7 +2284,8 @@ ELSE IF @LeftTable = 1
         (N'You''ve left the game. Thanks for playing! Run EXEC sp_TexasHoldEm_Public any time to get back in.');
 ELSE IF @GState = 'GameOver'
     INSERT @Prompt (Line) VALUES
-        (N'GAME OVER. Run EXEC sp_TexasHoldEm_Public to start a new game.');
+        (N'GAME OVER. Run EXEC sp_TexasHoldEm_Public @Action = ''NewGame'' to open a fresh game.'),
+        (N'A database administrator can use @Action = ''Reset'' to abandon a stuck game at any time.');
 ELSE IF @GState = 'InHand' AND @SeatExists = 1 AND @TurnSeat = @MySeat
      AND @MyNeedsToAct = 1 AND @MyFolded = 0
 BEGIN
