@@ -468,7 +468,10 @@ IF @Action = N'Join' SET @Action = NULL;
 IF @Action COLLATE Latin1_General_100_CI_AS IN (N'All In', N'All-In', N'All_In', N'Shove', N'Jam')
     SET @Action = N'AllIn';
 IF @Action COLLATE Latin1_General_100_CI_AS = N'Status'
+BEGIN
+    SET @Action = N'Status';
     SET @WaitForTurn = 0;
+END
 
 /* Explicit CI collation so this behaves the same on a case-sensitive
    database - the value picks a code path, so it can't drift with collation. */
