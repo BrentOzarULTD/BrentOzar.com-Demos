@@ -91,7 +91,7 @@
 
             try {
                 const response = await window.fetch(endpoint, {
-                    cache: 'no-store',
+                    cache: 'no-cache',
                     headers: { Accept: 'application/json' },
                     signal: controller.signal
                 });

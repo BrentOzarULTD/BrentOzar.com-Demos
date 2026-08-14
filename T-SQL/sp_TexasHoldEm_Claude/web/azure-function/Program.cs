@@ -1,4 +1,6 @@
 using System.Text.Json;
+using Azure.Core.Serialization;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,10 +11,13 @@ var builder = FunctionsApplication.CreateBuilder(args);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IPokerSnapshotSource, SqlPokerSnapshotSource>();
 builder.Services.AddSingleton<PokerSnapshotCache>();
-builder.Services.Configure<JsonSerializerOptions>(options =>
+builder.Services.Configure<WorkerOptions>(options =>
 {
-    options.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-    options.DictionaryKeyPolicy = JsonNamingPolicy.CamelCase;
+    options.Serializer = new JsonObjectSerializer(new JsonSerializerOptions(JsonSerializerDefaults.Web)
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DictionaryKeyPolicy = JsonNamingPolicy.CamelCase,
+    });
 });
 
 builder.Build().Run();
