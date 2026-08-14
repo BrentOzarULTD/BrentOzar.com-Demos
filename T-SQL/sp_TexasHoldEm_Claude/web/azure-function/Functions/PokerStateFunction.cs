@@ -29,7 +29,7 @@ public sealed class PokerStateFunction
             var etag = $"\"{snapshot.GeneratedAt.ToUnixTimeMilliseconds()}-{(snapshot.Stale ? 1 : 0)}\"";
 
             if (request.Headers.TryGetValues("If-None-Match", out var values)
-                && values.Any(value => string.Equals(value, etag, StringComparison.Ordinal)))
+                && MatchesIfNoneMatch(values, etag))
             {
                 var notModified = request.CreateResponse(HttpStatusCode.NotModified);
                 AddCacheHeaders(notModified, etag, _cache.CacheSeconds);
@@ -55,6 +55,33 @@ public sealed class PokerStateFunction
                 cancellationToken);
             return response;
         }
+    }
+
+    internal static bool MatchesIfNoneMatch(IEnumerable<string> headerValues, string currentEtag)
+    {
+        foreach (var headerValue in headerValues)
+        {
+            foreach (var rawCandidate in headerValue.Split(','))
+            {
+                var candidate = rawCandidate.Trim();
+                if (candidate == "*")
+                {
+                    return true;
+                }
+
+                if (candidate.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
+                {
+                    candidate = candidate[2..].TrimStart();
+                }
+
+                if (string.Equals(candidate, currentEtag, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private static void AddCacheHeaders(HttpResponseData response, string etag, int cacheSeconds)
