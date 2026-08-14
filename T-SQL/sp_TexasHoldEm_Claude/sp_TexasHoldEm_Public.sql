@@ -116,7 +116,8 @@ HOW TO PLAY
      query. To see more, pass @ShowWhatHappened:
         'ThisTurn'   - the default: just what you missed since last time.
         'ThisGame'   - every hand of the game currently being played.
-        'AllHistory' - the whole log, all the way back. Bring popcorn.
+        'AllHistory' - all retained log rows since the last RESET or explicit
+                       NEWGAME. Bring popcorn.
 
 Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
          Status (instant snapshot, never blocks), NewGame (after GAME OVER),
@@ -551,7 +552,7 @@ BEGIN
         (15,N'The query finishes when it''s your turn, and tells you exactly what to run next.'),
         (16,N'Results come back as: Hand, Seat, What Now, What Happened.'),
         (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
-        (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for every hand ever played here.'),
+        (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for all retained rows since RESET or explicit NEWGAME.'),
         (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- start fresh after GAME OVER'),
         (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table')
         ) v(LineId, Line)
