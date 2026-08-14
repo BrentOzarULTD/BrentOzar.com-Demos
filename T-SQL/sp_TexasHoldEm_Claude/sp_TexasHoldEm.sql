@@ -22,10 +22,9 @@ How to play:
         EXEC sp_TexasHoldEm @Action = 'Call',  @PlayerName = 'Brent';
         EXEC sp_TexasHoldEm @Action = 'Raise', @PlayerName = 'Brent';
         EXEC sp_TexasHoldEm @Action = 'Fold',  @PlayerName = 'Brent';
-        EXEC sp_TexasHoldEm @Action = 'AllIn', @PlayerName = 'Brent';
      After a hand ends, run EXEC sp_TexasHoldEm again to keep playing.
 
-Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
+Actions: Join (default), Check, Call, Bet, Raise, Fold, Leave, Watch,
          Status (instant snapshot, never blocks), Help.
 
 House rules:
@@ -33,15 +32,10 @@ House rules:
     turn & river, max one bet + three raises per round. Everybody starts
     with 1,000 chips; you're out when you're broke (but you can buy back in
     if a seat is open - the log will shame you appropriately).
-  - AllIn is the one move the limit doesn't limit: shove your whole stack any
-    time it's your turn, even when the raise cap is maxed out. The robots
-    will do it to you too.
   - 60-second shot clock per decision. Take too long and you auto-check or
     auto-fold; three strikes and your seat goes to the next player.
   - No side pots: you can call all-in for less, and if you win you take the
     whole pot. Vegas would not approve. Vegas also isn't a stored procedure.
-    The only mercy is that an uncalled bet comes back to you - shove 500 into
-    a player who only had 200 and you get the extra 300 returned.
 
 Requirements & caveats:
   - SQL Server 2017+ or Azure SQL DB (uses STRING_AGG and global ## tables).
@@ -87,7 +81,6 @@ DECLARE @rc int,
         @OwnerDb nvarchar(128),
         @Msg nvarchar(2047),
         @Notice nvarchar(500),
-        @LastNotice nvarchar(500),
         @MySeat tinyint,
         @MyInHand bit,
         @IsObserver bit = 0,
@@ -117,9 +110,7 @@ DECLARE @rc int,
         @NumPlayers int, @HumansLeft int, @NumInHand int, @Unfolded int, @ActiveBettors int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
-        @ActorRank1 int, @ActorRank2 int, @CanRaise bit, @Shove bit,
-        @Owed int, @Unit int, @NewBet int, @Pay int, @AllInTo int, @NextSeat tinyint, @r int,
-        @TopBet int, @NextBet int, @RefundSeat tinyint, @Refund int,
+        @Owed int, @Unit int, @NewBet int, @Pay int, @NextSeat tinyint, @r int,
         @BotMove varchar(10), @RoundBets int, @WinSeat tinyint, @WinName nvarchar(30),
         /* showdown & hand evaluation */
         @cSeat tinyint, @cName nvarchar(30), @cC1 tinyint, @cC2 tinyint,
@@ -157,14 +148,12 @@ INSERT #RankNames (RankValue, RankName, RankPlural) VALUES
 SET @Action = NULLIF(LTRIM(RTRIM(@Action)), N'');
 SET @PlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
 IF @Action = N'Join' SET @Action = NULL;
-/* Nobody types the same thing twice under pressure. Take all of them. */
-IF @Action IN (N'All In', N'All-In', N'All_In', N'Shove', N'Jam') SET @Action = N'AllIn';
 
 IF @Action IS NOT NULL
-   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
+   AND @Action NOT IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave', N'Watch', N'Status', N'Help')
 BEGIN
     SELECT [Say What?] = CONCAT(N'I don''t know the action ''', @Action,
-        N'''. Try: Join, Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch, Status, or Help.');
+        N'''. Try: Join, Check, Call, Bet, Raise, Fold, Leave, Watch, Status, or Help.');
     RETURN;
 END
 
@@ -176,13 +165,12 @@ BEGIN
         (2, N'EXEC sp_TexasHoldEm @Action = ''Check'',  @PlayerName = ''YourName'';'),
         (3, N'EXEC sp_TexasHoldEm @Action = ''Call'',   @PlayerName = ''YourName'';'),
         (4, N'EXEC sp_TexasHoldEm @Action = ''Raise'',  @PlayerName = ''YourName'';  -- ''Bet'' works too'),
-        (5, N'EXEC sp_TexasHoldEm @Action = ''AllIn'',  @PlayerName = ''YourName'';  -- shove the whole stack'),
-        (6, N'EXEC sp_TexasHoldEm @Action = ''Fold'',   @PlayerName = ''YourName'';'),
-        (7, N'EXEC sp_TexasHoldEm @Action = ''Leave'',  @PlayerName = ''YourName'';  -- cash out'),
-        (8, N'EXEC sp_TexasHoldEm @Action = ''Watch'';                              -- spectate, never sits you down'),
-        (9, N'EXEC sp_TexasHoldEm @Action = ''Status'';                             -- instant snapshot, never blocks'),
-        (10,N'While your query runs, watch the Messages tab - the action streams in live.'),
-        (11,N'The query finishes when it''s your turn, and tells you exactly what to run next.')
+        (5, N'EXEC sp_TexasHoldEm @Action = ''Fold'',   @PlayerName = ''YourName'';'),
+        (6, N'EXEC sp_TexasHoldEm @Action = ''Leave'',  @PlayerName = ''YourName'';  -- cash out'),
+        (7, N'EXEC sp_TexasHoldEm @Action = ''Watch'';                              -- spectate, never sits you down'),
+        (8, N'EXEC sp_TexasHoldEm @Action = ''Status'';                             -- instant snapshot, never blocks'),
+        (9, N'While your query runs, watch the Messages tab - the action streams in live.'),
+        (10,N'The query finishes when it''s your turn, and tells you exactly what to run next.')
         ) v(LineId, Line)
     ORDER BY v.LineId;
     RETURN;
@@ -225,7 +213,7 @@ BEGIN
 
         IF OBJECT_ID('tempdb..##TexasHoldEm_Game') IS NULL
         BEGIN
-            IF @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave', N'Watch', N'Status')
+            IF @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave', N'Watch', N'Status')
             BEGIN
                 COMMIT;
                 SELECT [No Game] = N'There''s no game running. Run EXEC sp_TexasHoldEm to start one.';
@@ -354,7 +342,7 @@ BEGIN
         /* Only actions that actually take control of the seat may reclaim it -
            a Status or Watch peek must never hijack a live player's session. */
         IF @MySeat IS NULL AND @PlayerName IS NOT NULL
-           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
+           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold', N'Leave'))
         BEGIN
             SET @CurOwner = NULL;
             SELECT @MySeat = SeatNum, @CurOwner = SessionId
@@ -415,13 +403,8 @@ BEGIN
             END
         END
 
-        /* Acting without passing @PlayerName is legal if the session already owns
-           a seat - borrow the seat's name so the play-by-play isn't anonymous. */
-        IF @MySeat IS NOT NULL AND @PlayerName IS NULL
-            SELECT @PlayerName = PlayerName FROM ##TexasHoldEm_Players WHERE SeatNum = @MySeat;
-
         /* Apply a betting action. */
-        IF @MySeat IS NOT NULL AND @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold')
+        IF @MySeat IS NOT NULL AND @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'Fold')
         BEGIN
             SELECT @GState = GameState, @TurnSeat = TurnSeat, @BetToCall = BetToCall,
                    @RaiseCount = RaiseCount, @Round = BettingRound, @GHand = HandNumber
@@ -444,17 +427,12 @@ BEGIN
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @RaiseCount >= @MaxRaises
                 BEGIN
-                    SET @Notice = N'Betting''s capped this round - you can Call, go AllIn, or Fold.';
+                    SET @Notice = N'Betting''s capped this round - you can Call or Fold.';
                     SET @ReturnNow = 1;
                 END
                 ELSE IF @Action IN (N'Bet', N'Raise') AND @MyChips < (@NewBet - @MyBet)
                 BEGIN
-                    SET @Notice = N'Not enough chips to raise. You can Call, go AllIn, or Fold.';
-                    SET @ReturnNow = 1;
-                END
-                ELSE IF @Action = N'AllIn' AND @MyChips <= 0
-                BEGIN
-                    SET @Notice = N'You''re already all in. Enjoy the ride.';
+                    SET @Notice = N'Not enough chips to raise. You can Call (all in if needed) or Fold.';
                     SET @ReturnNow = 1;
                 END
                 ELSE
@@ -482,32 +460,6 @@ BEGIN
                         INSERT ##TexasHoldEm_Log (HandNumber, Message)
                         VALUES (@GHand, CONCAT(@PlayerName, N' calls ', @Pay,
                                 CASE WHEN @MyChips <= @Owed THEN N' and is ALL IN.' ELSE N'.' END));
-                    END
-                    ELSE IF @Action = N'AllIn'
-                    BEGIN
-                        SET @Pay = @MyChips;
-                        SET @AllInTo = @MyBet + @Pay;   /* total wager this round */
-                        UPDATE ##TexasHoldEm_Players
-                           SET Chips = 0, BetThisRound = @AllInTo, AllIn = 1,
-                               NeedsToAct = 0, TimeoutStrikes = 0
-                         WHERE SeatNum = @MySeat;
-                        /* A shove that beats the current bet puts everyone back to work.
-                           Real poker wouldn't reopen betting for an undersized raise;
-                           this table isn't that fussy, and it ignores the raise cap too. */
-                        IF @AllInTo > @BetToCall
-                        BEGIN
-                            UPDATE ##TexasHoldEm_Players SET NeedsToAct = 1
-                             WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND SeatNum <> @MySeat;
-                            UPDATE ##TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
-                        END
-                        INSERT ##TexasHoldEm_Log (HandNumber, Message)
-                        VALUES (@GHand, CASE
-                                WHEN @AllInTo > @BetToCall
-                                    THEN CONCAT(@PlayerName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
-                                WHEN @AllInTo = @BetToCall
-                                    THEN CONCAT(@PlayerName, N' calls ALL IN for ', @Pay, N'.')
-                                ELSE CONCAT(@PlayerName, N' calls ALL IN for ', @Pay,
-                                            N', which doesn''t cover the ', @BetToCall, N'.') END);
                     END
                     ELSE /* Bet / Raise */
                     BEGIN
@@ -775,30 +727,7 @@ BEGIN
         ELSE IF NOT EXISTS (SELECT 1 FROM ##TexasHoldEm_Players
                             WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND NeedsToAct = 1)
         BEGIN
-            /* Betting round complete. First, hand back an uncalled bet: if one
-               player wagered more this round than anybody else could match -
-               the usual way to shove into a shorter stack - the excess is theirs.
-               This table has no side pots, so without this the overage would just
-               evaporate into a pot they can't win back. */
-            SET @TopBet = NULL; SET @NextBet = NULL; SET @RefundSeat = NULL;
-            SELECT TOP (1) @RefundSeat = SeatNum, @TopBet = BetThisRound
-            FROM ##TexasHoldEm_Players WHERE InHand = 1 ORDER BY BetThisRound DESC, SeatNum;
-            SELECT @NextBet = ISNULL(MAX(BetThisRound), 0)
-            FROM ##TexasHoldEm_Players WHERE InHand = 1 AND SeatNum <> @RefundSeat;
-            SET @Refund = ISNULL(@TopBet, 0) - ISNULL(@NextBet, 0);
-            IF @Refund > 0
-            BEGIN
-                UPDATE ##TexasHoldEm_Players
-                   SET Chips = Chips + @Refund, BetThisRound = BetThisRound - @Refund,
-                       AllIn = CASE WHEN Chips + @Refund > 0 THEN 0 ELSE AllIn END
-                 WHERE SeatNum = @RefundSeat;
-                INSERT ##TexasHoldEm_Log (HandNumber, Message)
-                SELECT @GHand, CONCAT(N'Nobody could cover it all, so ', PlayerName, N' takes back ',
-                       @Refund, N' in uncalled chips.')
-                FROM ##TexasHoldEm_Players WHERE SeatNum = @RefundSeat;
-            END
-
-            /* Now sweep what's left into the pot. */
+            /* Betting round complete: sweep the bets into the pot. */
             SELECT @RoundBets = ISNULL(SUM(BetThisRound), 0) FROM ##TexasHoldEm_Players WHERE InHand = 1;
             UPDATE ##TexasHoldEm_Players SET BetThisRound = 0 WHERE InHand = 1;
             SET @Pot += @RoundBets;
@@ -1067,9 +996,7 @@ BEGIN
         /* ===== Somebody owes the table a decision. ===== */
         SET @ActorSeat = NULL;
         SELECT @ActorSeat = SeatNum, @ActorBot = IsBot, @ActorName = PlayerName,
-               @ActorChips = Chips, @ActorBet = BetThisRound, @ActorStrikes = TimeoutStrikes,
-               /* CardId 0-51 encodes rank as CardId / 4 + 2 - see the #Cards deck above. */
-               @ActorRank1 = Card1 / 4 + 2, @ActorRank2 = Card2 / 4 + 2
+               @ActorChips = Chips, @ActorBet = BetThisRound, @ActorStrikes = TimeoutStrikes
         FROM ##TexasHoldEm_Players
         WHERE SeatNum = @TurnSeat AND InHand = 1 AND Folded = 0 AND AllIn = 0 AND NeedsToAct = 1;
 
@@ -1090,50 +1017,23 @@ BEGIN
 
         IF @ActorBot = 1
         BEGIN
-            /* The robot "brain": it actually looks at its hole cards now. Pairs and
-               big cards get raised, junk gets folded when it's facing a bet, and the
-               dice decide the rest so the table stays unpredictable. Still not GTO. */
+            /* The robot "brain": mostly calls, sometimes raises, occasionally
+               remembers it has feelings and folds. Do not study this for GTO. */
             SET @r = ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 100;
-            /* Fixed-limit table: a raise needs an open raise slot and the chips to make it. */
-            SET @CanRaise = CASE WHEN @RaiseCount < @MaxRaises AND @ActorChips >= (@NewBet - @ActorBet)
-                                 THEN 1 ELSE 0 END;
-            /* Shoving is only for short stacks. This is a LIMIT table with 50 big
-               bets in front of everyone at the start, so a robot that jams its whole
-               stack on hand one just ends the game - which is exactly what the first
-               test run did. A stack only goes in when the fixed-limit bets can't get
-               it in anyway: desperation under two bets, or a monster under five.
-               @r is 0-99, so "@r < 45" is a 45% chance. */
-            SET @Shove = CASE WHEN @ActorChips > 0
-                               AND ((@ActorChips <= 2 * @Unit AND @r < 45)
-                                    OR (@ActorChips <= 5 * @Unit
-                                        AND @ActorRank1 = @ActorRank2 AND @ActorRank1 >= 12
-                                        AND @r < 60))
-                              THEN 1 ELSE 0 END;
-
-            IF @Owed > 0
+            IF @Owed <= 0
             BEGIN
-                /* Junk hands, and bets that cost more than a third of the stack, get away. */
-                IF (@ActorRank1 <> @ActorRank2 AND @ActorRank1 < 10 AND @ActorRank2 < 10 AND @r < 22)
-                   OR (@Owed > (@ActorChips / 3) AND @r < 35)
-                    SET @BotMove = 'Fold';
-                ELSE IF @Shove = 1
-                    SET @BotMove = 'AllIn';
-                ELSE IF (@ActorRank1 = @ActorRank2 OR @ActorRank1 >= 12 OR @ActorRank2 >= 12)
-                     AND @r >= 82 AND @CanRaise = 1
-                    SET @BotMove = 'Raise';
+                IF @r < 70 OR @RaiseCount >= @MaxRaises OR @ActorChips < (@NewBet - @ActorBet)
+                    SET @BotMove = 'Check';
                 ELSE
-                    SET @BotMove = 'Call';
+                    SET @BotMove = 'Raise';
             END
             ELSE
             BEGIN
-                /* Nothing to call: bet the premium hands, plus the occasional bluff. */
-                IF @Shove = 1
-                    SET @BotMove = 'AllIn';
-                ELSE IF (@ActorRank1 = @ActorRank2 OR @ActorRank1 >= 13 OR @ActorRank2 >= 13 OR @r >= 80)
-                     AND @CanRaise = 1
+                IF @r < 55 SET @BotMove = 'Call';
+                ELSE IF @r < 78 AND @RaiseCount < @MaxRaises AND @ActorChips >= (@NewBet - @ActorBet)
                     SET @BotMove = 'Raise';
-                ELSE
-                    SET @BotMove = 'Check';
+                ELSE IF @r < 82 SET @BotMove = 'Call';
+                ELSE SET @BotMove = 'Fold';
             END
 
             IF @BotMove = 'Check'
@@ -1151,28 +1051,6 @@ BEGIN
                 INSERT ##TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, CONCAT(@ActorName, N' calls ', @Pay,
                         CASE WHEN @ActorChips <= @Owed THEN N' and is ALL IN.' ELSE N'.' END));
-            END
-            ELSE IF @BotMove = 'AllIn'
-            BEGIN
-                SET @Pay = @ActorChips;
-                SET @AllInTo = @ActorBet + @Pay;
-                UPDATE ##TexasHoldEm_Players
-                   SET Chips = 0, BetThisRound = @AllInTo, AllIn = 1, NeedsToAct = 0
-                 WHERE SeatNum = @ActorSeat;
-                IF @AllInTo > @BetToCall
-                BEGIN
-                    UPDATE ##TexasHoldEm_Players SET NeedsToAct = 1
-                     WHERE InHand = 1 AND Folded = 0 AND AllIn = 0 AND SeatNum <> @ActorSeat;
-                    UPDATE ##TexasHoldEm_Game SET BetToCall = @AllInTo, RaiseCount = RaiseCount + 1;
-                END
-                INSERT ##TexasHoldEm_Log (HandNumber, Message)
-                VALUES (@GHand, CASE
-                        WHEN @AllInTo > @BetToCall
-                            THEN CONCAT(@ActorName, N' moves ALL IN for ', @Pay, N'. It''s ', @AllInTo, N' to call.')
-                        WHEN @AllInTo = @BetToCall
-                            THEN CONCAT(@ActorName, N' calls ALL IN for ', @Pay, N'.')
-                        ELSE CONCAT(@ActorName, N' calls ALL IN for ', @Pay,
-                                    N', which doesn''t cover the ', @BetToCall, N'.') END);
             END
             ELSE IF @BotMove = 'Raise'
             BEGIN
@@ -1307,10 +1185,11 @@ BEGIN
         SET @CardsShownForHand = @GHand;
     END
 
-    /* Hang onto the notice. If this pass turns out to be the one that hands
-       results back, the severity-11 raise at the very bottom delivers it and
-       drags SSMS over to the Messages tab. */
-    IF @Notice IS NOT NULL SET @LastNotice = @Notice;
+    IF @Notice IS NOT NULL
+    BEGIN
+        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
+        SET @Notice = NULL;
+    END
 
     /* Is there a reason to give this session its results back? */
     IF @ReturnNow = 1 BREAK;
@@ -1328,15 +1207,6 @@ BEGIN
     BEGIN
         SET @GaveUp = 1;
         BREAK;
-    END
-
-    /* Still waiting, so say it now rather than making them wait for the
-       end-of-proc raise - and clear it, since they've now seen it. */
-    IF @Notice IS NOT NULL
-    BEGIN
-        RAISERROR(N'%s', 0, 1, @Notice) WITH NOWAIT;
-        SET @Notice = NULL;
-        SET @LastNotice = NULL;
     END
 
     IF @ToldWaiting = 0
@@ -1479,12 +1349,6 @@ BEGIN
             (CONCAT(N'EXEC sp_TexasHoldEm @Action = ''Raise''', @NameArg, N';',
                     CASE WHEN @BetToCall = 0 THEN N'   -- bet ' ELSE N'   -- raise to ' END, @NewBet));
 
-    /* The shove is always on the menu - the raise cap doesn't apply to it. */
-    IF @MyChips > 0 AND (@MyChips > @Owed OR @Owed <= 0)
-        INSERT @Prompt (Line) VALUES
-            (CONCAT(N'EXEC sp_TexasHoldEm @Action = ''AllIn''', @NameArg, N';',
-                    N'   -- shove all ', @MyChips, N', for a total of ', @MyBet + @MyChips, N' this round'));
-
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'EXEC sp_TexasHoldEm @Action = ''Fold''', @NameArg, N';'));
 END
@@ -1514,17 +1378,6 @@ BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK;
     THROW;
 END CATCH
-
-/* SSMS focuses the Results grid whenever a query returns one, which buries
-   whatever we said in the Messages tab. Severity 11+ is the only thing that
-   pulls focus back there, so when the player needs to READ something - a
-   rejected action, a "not your turn" - we hand it back as an error on the way
-   out. Severity 11 doesn't abort the batch and leaves SQLCMD's exit code at 0;
-   it just turns the text red and wins the argument about which tab you're
-   looking at. This lives after END CATCH on purpose: raised inside the TRY,
-   the CATCH above would swallow it and roll the game back. */
-IF @LastNotice IS NOT NULL
-    RAISERROR(N'%s', 11, 1, @LastNotice);
 END
 GO
 
