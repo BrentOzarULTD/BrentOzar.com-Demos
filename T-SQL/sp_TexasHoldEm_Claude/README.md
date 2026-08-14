@@ -100,12 +100,14 @@ tables have no permissions: any player can read hole cards, forge chips, or
 drop the game. The public build assumes the opposite — every player is
 hostile and fluent in T-SQL — and changes the design accordingly:
 
-- **Real tables + ownership chaining.** Game state moves to
-  `dbo.TexasHoldEm_Game`, `_Players`, and `_Log`, created by an admin.
-  Players get `GRANT EXECUTE` on the proc and *nothing else*: the proc can
-  touch the tables (same owner), the players can't. No card peeking, no
-  chip forging, no dropping the casino — and the game survives disconnects,
-  so nobody's session is load-bearing anymore.
+- **Protected, encrypted state.** Game state moves to four tables in the
+  `TexasHoldEm_Public` schema, created by an admin. Hole-card identifiers are
+  encrypted at rest and decrypted only in authorized paths inside the
+  certificate-signed procedure. The dedicated player role can execute the
+  procedure, is explicitly denied direct access to the schema, and receives
+  no certificate permissions. No card peeking, chip forging, or dropping the
+  casino — and the game survives disconnects, so nobody's session is
+  load-bearing anymore.
 - **Seat passwords.** Reclaiming a seat by `@PlayerName` from a new session
   now requires the optional `@SeatPassword` you joined with (salted SHA-256
   in the table). No password, no reclaim, no hijacking someone's stack.
@@ -125,23 +127,29 @@ hostile and fluent in T-SQL — and changes the design accordingly:
   after 30 minutes to hand their worker threads back.
 
 Setup (as an admin, in the database that hosts the game): run the whole
-script — it creates the three tables plus the proc, and re-running it won't
-wipe a game in progress. Then create a login for the public and grant it
-exactly one thing:
+script — it creates the protected schema, four tables, certificate, player
+role, and signed procedure. Re-running it won't wipe a game in progress;
+upgrading an older installation transfers its tables into the protected
+schema and encrypts any active hole cards before removing the plaintext
+columns. Then create a login for the public and add its user to exactly one
+role:
 
 ```sql
 -- In master:
 CREATE LOGIN PokerPublic WITH PASSWORD = N'something long and weird';
 -- In the game database:
 CREATE USER PokerPublic FOR LOGIN PokerPublic;
-GRANT EXECUTE ON OBJECT::dbo.sp_TexasHoldEm_Public TO PokerPublic;
+ALTER ROLE TexasHoldEm_Public_Players ADD MEMBER PokerPublic;
 ```
 
-Don't add that user to any database roles, don't grant `VIEW DATABASE
+Don't add that user to any other database roles, don't grant `VIEW DATABASE
 STATE`, and don't add `EXECUTE AS` to the proc (it would break the
-session-identity check). What hostile players can still do: play badly,
-stall (the shot clock folds them), and open lots of connections — so host
-it in a small, cheap database that shares hardware with nothing you love.
+session-identity check). Database owners, server administrators, and
+principals allowed to alter the procedure, protected schema, tables, or
+certificate remain outside this security boundary. What hostile players can
+still do: play badly, stall (the shot clock folds them), and open lots of
+connections — so host it in a small, cheap database that shares hardware
+with nothing you love.
 
 ## How it works, briefly
 
