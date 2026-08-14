@@ -648,11 +648,22 @@ BEGIN
                     END
                 END
             END
-            IF @WaitId IS NOT NULL AND @ReturnNow = 0
+            IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @Action = N'Leave'
+            BEGIN
+                /* A queued human can bail too - otherwise an abandoned entry
+                   sits on one of the four waitlist slots until it's promoted
+                   or the whole table gets swept. */
+                DELETE dbo.TexasHoldEm_Waitlist WHERE WaitId = @WaitId;
+                SET @Notice = N'You''re off the waitlist. Thanks for your patience!';
+                SET @LeftTable = 1;
+                SET @ReturnNow = 1;
+            END
+            ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0
             BEGIN
                 SELECT @WaitPos = COUNT(*) FROM dbo.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId;
                 SET @Notice = CONCAT(N'Still on the waitlist, #', @WaitPos,
-                    N' in line for a seat. Run EXEC sp_TexasHoldEm_Public again in a bit to check.');
+                    N' in line for a seat. Run EXEC sp_TexasHoldEm_Public again in a bit',
+                    N', or EXEC sp_TexasHoldEm_Public @Action = ''Leave'' to give up your spot.');
                 SET @ReturnNow = 1;
             END
         END
@@ -923,8 +934,10 @@ BEGIN
             END
         END
 
-        /* Cash out. */
-        IF @Action = N'Leave'
+        /* Cash out. Skipped if @ReturnNow is already 1 - a waitlisted Leave
+           was just handled above, and this generic "you weren't seated"
+           branch would otherwise stomp that notice right back off. */
+        IF @Action = N'Leave' AND @ReturnNow = 0
         BEGIN
             IF @MySeat IS NULL
                 SET @Notice = N'You weren''t seated anyway. Easiest fold of your life.';
