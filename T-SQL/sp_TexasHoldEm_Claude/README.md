@@ -72,9 +72,9 @@ The four result sets keep the same order and shape in both modes.
 
 Actions are case-insensitive. A normal join after `GAME OVER` still starts a
 new game for backward compatibility; `NewGame` makes that lifecycle choice
-explicit. `Reset` clears seats, waitlist reservations, cards, bets, pot, and
-game log state under the game lock, and records the initiating database
-identity in the new log without including credentials.
+explicit. Both lifecycle commands clear seats, waitlist reservations, cards,
+bets, pot, and prior game log state under the game lock, then record the
+initiating database identity in the new log without including credentials.
 
 ## House rules
 
