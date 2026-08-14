@@ -126,10 +126,11 @@ Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
 House rules:
   - Fixed-limit Hold 'Em: blinds 10/20, bets 20 pre-flop & flop, 40 on the
     turn & river, max one bet + three raises per round. Everybody starts
-    with 1,000 chips; you're out when you're broke (but you can buy back in
-    if a seat is open - the log will shame you appropriately).
+    with 1,000 chips. When you're broke, that identity stays OUT for 60
+    minutes instead of receiving another free stack.
   - 60-second shot clock per decision. Take too long and you auto-check or
-    auto-fold; three strikes and your seat goes to the next player.
+    auto-fold; three strikes cost your seat, but your remaining stack is
+    retained for a 10-minute reconnect window.
   - AllIn is the one move the limit doesn't limit: shove your whole stack any
     time it's your turn, even when the raise cap is maxed out. The robots will
     do it to you too, but only when they're short-stacked.
@@ -209,6 +210,12 @@ BEGIN
     IF OBJECT_ID(N'TexasHoldEm_Public.TexasHoldEm_Log', N'U') IS NOT NULL
         THROW 50023, 'Both legacy and protected TexasHoldEm_Log tables exist. Reconcile them before rerunning the installer.', 1;
     ALTER SCHEMA TexasHoldEm_Public TRANSFER dbo.TexasHoldEm_Log;
+END;
+IF OBJECT_ID(N'dbo.TexasHoldEm_Identities', N'U') IS NOT NULL
+BEGIN
+    IF OBJECT_ID(N'TexasHoldEm_Public.TexasHoldEm_Identities', N'U') IS NOT NULL
+        THROW 50025, 'Both legacy and protected TexasHoldEm_Identities tables exist. Reconcile them before rerunning the installer.', 1;
+    ALTER SCHEMA TexasHoldEm_Public TRANSFER dbo.TexasHoldEm_Identities;
 END;
 GO
 
@@ -295,6 +302,91 @@ CREATE TABLE TexasHoldEm_Public.TexasHoldEm_Waitlist (
        mid-hand bump branch below. Reserved entries skip the FIFO line. */
     ReservedSeat tinyint NULL,
     JoinedAt datetime2 NOT NULL DEFAULT SYSDATETIME());
+
+/* Human identity and bankroll outlive a physical chair. This is deliberately
+   separate from TexasHoldEm_Players so the hot-path seat engine can keep its
+   compact, non-null SeatNum key while busted and timed-out humans remain
+   recognizable for a bounded grace period. */
+IF OBJECT_ID(N'TexasHoldEm_Public.TexasHoldEm_Identities', N'U') IS NULL
+BEGIN
+    CREATE TABLE TexasHoldEm_Public.TexasHoldEm_Identities
+    (
+        IdentityId bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT PK_TexasHoldEm_Identities PRIMARY KEY,
+        PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS NOT NULL
+            CONSTRAINT UQ_TexasHoldEm_Identities_PlayerName UNIQUE,
+        SessionId int NOT NULL,
+        SessionLoginTime datetime2 NULL,
+        PasswordSalt varbinary(16) NULL,
+        PasswordHash varbinary(32) NULL,
+        Chips int NOT NULL,
+        PlayerRole varchar(12) NOT NULL,
+        WantsSeat bit NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_WantsSeat DEFAULT (0),
+        TimedOut bit NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_TimedOut DEFAULT (0),
+        JoinedAt datetime2 NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_JoinedAt DEFAULT SYSDATETIME(),
+        LastSeenAt datetime2 NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_LastSeenAt DEFAULT SYSDATETIME(),
+        LastPlayedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_LastPlayedHand DEFAULT (0),
+        LastViewedHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Identities_LastViewedHand DEFAULT (0),
+        CONSTRAINT CK_TexasHoldEm_Identities_Role
+            CHECK (PlayerRole IN ('PLAYER', 'SPECTATOR', 'OUT')),
+        CONSTRAINT CK_TexasHoldEm_Identities_Amounts
+            CHECK (Chips >= 0 AND LastPlayedHand >= 0 AND LastViewedHand >= 0)
+    );
+
+    CREATE INDEX IX_TexasHoldEm_Identities_Retention
+        ON TexasHoldEm_Public.TexasHoldEm_Identities
+           (PlayerRole, LastSeenAt, JoinedAt);
+END;
+
+/* Adopt live pre-identity seats and waiters without resetting their stacks or
+   reconnect credentials. Re-running the installer refreshes active rows but
+   never overwrites a retained spectator/OUT bankroll with 1,000. */
+UPDATE i
+   SET SessionId = p.SessionId, SessionLoginTime = p.SessionLoginTime,
+       PasswordSalt = p.PasswordSalt, PasswordHash = p.PasswordHash,
+       Chips = p.Chips, PlayerRole = 'PLAYER', WantsSeat = 0,
+       TimedOut = 0, LastPlayedHand = p.LastPlayedHand,
+       LastViewedHand = p.LastViewedHand
+FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+  ON p.PlayerName = i.PlayerName
+WHERE p.IsBot = 0;
+
+INSERT TexasHoldEm_Public.TexasHoldEm_Identities
+    (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash,
+     Chips, PlayerRole, WantsSeat, TimedOut, LastPlayedHand, LastViewedHand)
+SELECT p.PlayerName, p.SessionId, p.SessionLoginTime, p.PasswordSalt, p.PasswordHash,
+       p.Chips, 'PLAYER', 0, 0, p.LastPlayedHand, p.LastViewedHand
+FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+WHERE p.IsBot = 0
+  AND NOT EXISTS
+      (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+       WHERE i.PlayerName = p.PlayerName);
+
+UPDATE i
+   SET SessionId = w.SessionId, SessionLoginTime = w.SessionLoginTime,
+       PasswordSalt = w.PasswordSalt, PasswordHash = w.PasswordHash,
+       WantsSeat = 1
+FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+JOIN TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+  ON w.PlayerName = i.PlayerName
+WHERE i.PlayerRole = 'SPECTATOR';
+
+INSERT TexasHoldEm_Public.TexasHoldEm_Identities
+    (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash,
+     Chips, PlayerRole, WantsSeat, TimedOut, JoinedAt)
+SELECT w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+       1000, 'SPECTATOR', 1, 0, w.JoinedAt
+FROM TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+WHERE NOT EXISTS
+      (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+       WHERE i.PlayerName = w.PlayerName);
 
 IF OBJECT_ID(N'TexasHoldEm_Public.TexasHoldEm_Log', N'U') IS NULL
 CREATE TABLE TexasHoldEm_Public.TexasHoldEm_Log (
@@ -387,7 +479,10 @@ DECLARE @SmallBlind int = 10,
         @MaxTimeoutStrikes int = 3,
         @BetweenHandsSeconds int = 60, /* acknowledgement deadline */
         @MaxWaitMinutes int = 30,    /* give up blocking after this long - waiting queries hold worker threads */
-        @AbandonedAfterMinutes int = 30;  /* sweep a table nobody's touched in this long */
+        @AbandonedAfterMinutes int = 30,  /* sweep a table nobody's touched in this long */
+        @SpectatorRetentionMinutes int = 10,
+        @OutRetentionMinutes int = 60,
+        @MaxRetainedIdentities int = 64;
 DECLARE @MaxWaitlist int = @MaxHumans - @MaxSeats;
 
 DECLARE @rc int,
@@ -433,7 +528,7 @@ DECLARE @rc int,
         @MyChips int, @MyBet int, @MyC1 tinyint, @MyC2 tinyint, @MyCards nvarchar(12),
         /* engine workspace */
         @Spins int, @StartHandNow bit, @HandDone bit,
-        @NumPlayers int, @HumansLeft int, @NumInHand int, @Unfolded int, @ActiveBettors int,
+        @NumPlayers int, @HumansLeft int, @ReturningHumans int, @NumInHand int, @Unfolded int, @ActiveBettors int,
         @UnviewedHumans int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
@@ -452,6 +547,17 @@ DECLARE @rc int,
         @BestScore bigint, @NumWinners int, @Share int, @Rem int,
         @NameArg nvarchar(80), @SecondsLeft int,
         @LifecycleActor nvarchar(128);
+
+DECLARE @IdentityFound bit = 0,
+        @IdentityRole varchar(12),
+        @IdentityTimedOut bit = 0,
+        @IdentityChips int,
+        @JoinChips int = @StartingChips,
+        @IdentityName nvarchar(30),
+        @IdentityId bigint,
+        @IdentitySession int,
+        @IdentityLoginTime datetime2,
+        @IdentitiesToEvict int;
 
 DECLARE @NewLog TABLE (LogId int, Message nvarchar(500));
 DECLARE @Shuffled TABLE (Pos int, CardId tinyint);
@@ -473,8 +579,10 @@ DECLARE @PlayerSnapshot TABLE
     AllIn bit NOT NULL,
     Cards nvarchar(12) NOT NULL
 );
-DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30),
-    SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32));
+DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS,
+    SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32), Chips int);
+DECLARE @EvictedIdentities TABLE
+    (PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS PRIMARY KEY);
 
 /* A deck of cards. CardId 0-51: rank = CardId / 4 + 2 (2..14), suit = CardId % 4. */
 CREATE TABLE #Poker_Cards (CardId tinyint PRIMARY KEY, CardRank int, CardSuit tinyint, Display nvarchar(3));
@@ -568,7 +676,9 @@ BEGIN
         (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
         (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for all retained rows since RESET or explicit NEWGAME.'),
         (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- start fresh after GAME OVER'),
-        (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table')
+        (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table'),
+        (21,N'Busted identities stay OUT for 60 minutes; they cannot immediately collect another free stack.'),
+        (22,N'Timed-out players keep their chips off-table for 10 minutes and may reconnect to request a seat.')
         ) v(LineId, Line)
     ORDER BY v.LineId;
     RETURN;
@@ -615,7 +725,7 @@ END
    table raises error 208 from a lower execution level, which - unlike a
    same-scope compile error - this proc CAN catch and translate. */
 BEGIN TRY
-    EXEC sp_executesql N'SELECT TOP (0) 1 FROM TexasHoldEm_Public.TexasHoldEm_Game, TexasHoldEm_Public.TexasHoldEm_Players, TexasHoldEm_Public.TexasHoldEm_Log, TexasHoldEm_Public.TexasHoldEm_Waitlist;';
+    EXEC sp_executesql N'SELECT TOP (0) 1 FROM TexasHoldEm_Public.TexasHoldEm_Game, TexasHoldEm_Public.TexasHoldEm_Players, TexasHoldEm_Public.TexasHoldEm_Log, TexasHoldEm_Public.TexasHoldEm_Waitlist, TexasHoldEm_Public.TexasHoldEm_Identities;';
 END TRY
 BEGIN CATCH
     IF ERROR_NUMBER() = 208
@@ -702,6 +812,7 @@ BEGIN
 
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Identities;
             DELETE TexasHoldEm_Public.TexasHoldEm_Log;
 
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game
@@ -755,6 +866,8 @@ BEGIN
         IF (SELECT GameState FROM TexasHoldEm_Public.TexasHoldEm_Game) = 'GameOver' AND @Action IS NULL
         BEGIN
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Identities;
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game
                SET GameState = 'WaitingForPlayers', HandNumber = 0, DealerSeat = NULL,
                    SmallBlindSeat = NULL, BigBlindSeat = NULL, BettingRound = NULL,
@@ -766,6 +879,166 @@ BEGIN
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
             VALUES (0, CONCAT(N'A new game is starting! Waiting up to ', @JoinWindowSeconds,
                     N' seconds for players to join.'));
+        END
+
+        /* Keep the durable human record synchronized with active seats and
+           waiters. Bets still mutate the compact seat table; the identity
+           copy is refreshed under this same lock on every call and again at
+           hand end before any seat is removed. */
+        UPDATE i
+           SET SessionId = p.SessionId, SessionLoginTime = p.SessionLoginTime,
+               PasswordSalt = p.PasswordSalt, PasswordHash = p.PasswordHash,
+               Chips = p.Chips, PlayerRole = 'PLAYER', WantsSeat = 0,
+               TimedOut = 0, LastPlayedHand = p.LastPlayedHand,
+               LastViewedHand = p.LastViewedHand
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+        JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+          ON p.PlayerName = i.PlayerName
+        WHERE p.IsBot = 0;
+
+        UPDATE i
+           SET SessionId = w.SessionId, SessionLoginTime = w.SessionLoginTime,
+               PasswordSalt = w.PasswordSalt, PasswordHash = w.PasswordHash,
+               WantsSeat = 1
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+        JOIN TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+          ON w.PlayerName = i.PlayerName
+        WHERE i.PlayerRole = 'SPECTATOR';
+
+        /* The connection that owns an identity keeps it alive even if its
+           name was omitted on this invocation. */
+        UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+           SET LastSeenAt = SYSDATETIME()
+         WHERE SessionId = @@SPID AND SessionLoginTime = @MyLoginTime;
+
+        /* Expire abandoned, unseated identities so names and storage do not
+           stay reserved forever. Waitlist rows are removed with their stale
+           identity; active physical seats are never candidates. */
+        DELETE @EvictedIdentities;
+        INSERT @EvictedIdentities (PlayerName)
+        SELECT i.PlayerName
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+        WHERE NOT EXISTS
+              (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+               WHERE p.IsBot = 0 AND p.PlayerName = i.PlayerName)
+          AND NOT (i.SessionId = @@SPID AND i.SessionLoginTime = @MyLoginTime)
+          AND
+          (
+              (i.PlayerRole = 'SPECTATOR'
+               AND i.LastSeenAt < DATEADD(minute, -@SpectatorRetentionMinutes, SYSDATETIME()))
+              OR
+              (i.PlayerRole = 'OUT'
+               AND i.LastSeenAt < DATEADD(minute, -@OutRetentionMinutes, SYSDATETIME()))
+          );
+
+        DELETE w
+        FROM TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+        JOIN @EvictedIdentities AS e ON e.PlayerName = w.PlayerName;
+        DELETE i
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+        JOIN @EvictedIdentities AS e ON e.PlayerName = i.PlayerName;
+
+        /* Resolve retained identity by the non-recycled session pair first.
+           A different connection may take control only with the password and
+           only on the same actions that already reclaim a live seat. */
+        SET @IdentityFound = 0; SET @IdentityId = NULL; SET @IdentityName = NULL;
+        SET @IdentityRole = NULL; SET @IdentityChips = NULL; SET @IdentityTimedOut = 0;
+        SELECT @IdentityFound = 1, @IdentityId = IdentityId,
+               @IdentityName = PlayerName, @IdentityRole = PlayerRole,
+               @IdentityChips = Chips, @IdentityTimedOut = TimedOut,
+               @IdentitySession = SessionId, @IdentityLoginTime = SessionLoginTime,
+               @SeatSalt = PasswordSalt, @SeatHash = PasswordHash
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities
+        WHERE SessionId = @@SPID AND SessionLoginTime = @MyLoginTime;
+
+        IF @IdentityFound = 0 AND @PlayerName IS NOT NULL
+           AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
+        BEGIN
+            SET @IdentityId = NULL; SET @SeatSalt = NULL; SET @SeatHash = NULL;
+            SELECT @IdentityId = IdentityId, @IdentityName = PlayerName,
+                   @IdentityRole = PlayerRole, @IdentityChips = Chips,
+                   @IdentityTimedOut = TimedOut,
+                   @IdentitySession = SessionId, @IdentityLoginTime = SessionLoginTime,
+                   @SeatSalt = PasswordSalt, @SeatHash = PasswordHash
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities
+            WHERE PlayerName = @PlayerName;
+
+            IF @IdentityId IS NOT NULL
+            BEGIN
+                IF @SeatHash IS NOT NULL AND @SeatPassword IS NOT NULL
+                   AND @SeatHash = HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword))
+                BEGIN
+                    SET @IdentityFound = 1;
+                    UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                       SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime,
+                           LastSeenAt = SYSDATETIME()
+                     WHERE IdentityId = @IdentityId;
+                    UPDATE TexasHoldEm_Public.TexasHoldEm_Players
+                       SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime
+                     WHERE IsBot = 0 AND PlayerName = @IdentityName;
+                    UPDATE TexasHoldEm_Public.TexasHoldEm_Waitlist
+                       SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime
+                     WHERE PlayerName = @IdentityName;
+                END
+                ELSE
+                BEGIN
+                    SET @Notice = CASE WHEN @SeatHash IS NULL
+                        THEN N'That retained identity has no @SeatPassword, so another session cannot reclaim it yet.'
+                        ELSE N'That retained identity belongs to another session. Pass the right @SeatPassword to reconnect.' END;
+                    SET @ReturnNow = 1;
+                END
+            END
+        END
+
+        IF @IdentityFound = 1
+        BEGIN
+            /* Preserve an active same-session rename request; retained
+               unseated identities always use their canonical saved name. */
+            IF @PlayerName IS NULL OR @IdentityRole <> 'PLAYER'
+                SET @PlayerName = @IdentityName;
+            SET @JoinChips = @IdentityChips;
+            IF @IdentityRole = 'OUT'
+               AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
+            BEGIN
+                SET @Notice = CONCAT(N'You are OUT with 0 chips. That identity stays busted for ',
+                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the tournament roster.');
+                SET @ReturnNow = 1;
+            END
+        END
+
+        /* Bound all retained humans at 64. A genuinely new join evicts the
+           oldest OUT identity first, then the stalest spectator, and never an
+           active seat. */
+        IF @IdentityFound = 0 AND @ReturnNow = 0 AND @Action IS NULL
+           AND (SELECT COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Identities) >= @MaxRetainedIdentities
+        BEGIN
+            SELECT @IdentitiesToEvict = COUNT(*) - (@MaxRetainedIdentities - 1)
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities;
+
+            DELETE @EvictedIdentities;
+            INSERT @EvictedIdentities (PlayerName)
+            SELECT TOP (@IdentitiesToEvict) i.PlayerName
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+            WHERE i.PlayerRole IN ('OUT', 'SPECTATOR')
+              AND NOT EXISTS
+                  (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+                   WHERE p.IsBot = 0 AND p.PlayerName = i.PlayerName)
+            ORDER BY CASE WHEN i.PlayerRole = 'OUT' THEN 0 ELSE 1 END,
+                     i.LastSeenAt, i.JoinedAt, i.IdentityId;
+
+            DELETE w
+            FROM TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+            JOIN @EvictedIdentities AS e ON e.PlayerName = w.PlayerName;
+            DELETE i
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+            JOIN @EvictedIdentities AS e ON e.PlayerName = i.PlayerName;
+
+            IF (SELECT COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Identities) >= @MaxRetainedIdentities
+            BEGIN
+                SET @Notice = N'The retained-identity roster is full of active players. You can watch, but a new player cannot join yet.';
+                SET @ReturnNow = 1;
+                SET @IsObserver = 1;
+            END
         END
 
         /* Find my seat: by session identity first (session_id + login_time),
@@ -821,13 +1094,19 @@ BEGIN
         BEGIN
             IF EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE PlayerName = @PlayerName AND SeatNum <> @MySeat)
                OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+               OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities
+                           WHERE PlayerName = @PlayerName AND IdentityId <> ISNULL(@IdentityId, -1))
                 SET @Notice = N'That name''s already taken, so your name is unchanged.';
             ELSE
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                 SELECT g.HandNumber, CONCAT(p.PlayerName, N' is now known as ', @PlayerName, N'.')
                 FROM TexasHoldEm_Public.TexasHoldEm_Game g CROSS JOIN TexasHoldEm_Public.TexasHoldEm_Players p WHERE p.SeatNum = @MySeat;
+                UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                   SET PlayerName = @PlayerName, LastSeenAt = SYSDATETIME()
+                 WHERE IdentityId = @IdentityId;
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Players SET PlayerName = @PlayerName WHERE SeatNum = @MySeat;
+                SET @IdentityName = @PlayerName;
             END
         END
 
@@ -859,9 +1138,15 @@ BEGIN
                 BEGIN
                     IF @SeatHash IS NOT NULL AND @SeatPassword IS NOT NULL
                        AND @SeatHash = HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword))
+                    BEGIN
                         UPDATE TexasHoldEm_Public.TexasHoldEm_Waitlist
                            SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime
                          WHERE WaitId = @WaitId;
+                        UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                           SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime,
+                               LastSeenAt = SYSDATETIME()
+                         WHERE PlayerName = @PlayerName;
+                    END
                     ELSE
                     BEGIN
                         SET @Notice = CASE
@@ -880,6 +1165,11 @@ BEGIN
                    sits on one of the four waitlist slots until it's promoted
                    or the whole table gets swept. */
                 DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE WaitId = @WaitId;
+                UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                   SET PlayerRole = 'SPECTATOR', WantsSeat = 0,
+                       LastSeenAt = SYSDATETIME()
+                 WHERE PlayerName = @PlayerName;
+                SET @IdentityRole = 'SPECTATOR';
                 SET @Notice = N'You''re off the waitlist. Thanks for your patience!';
                 SET @LeftTable = 1;
                 SET @ReturnNow = 1;
@@ -905,6 +1195,14 @@ BEGIN
         /* Take a seat if there's room; otherwise queue up or watch from the rail. */
         IF @MySeat IS NULL AND @IsObserver = 0 AND @ReturnNow = 0
         BEGIN
+            /* The legacy seat/waitlist probes clear these workspace values
+               when no physical row exists. Reload durable credentials before
+               a retained spectator is reseated or requeued. */
+            IF @IdentityFound = 1
+                SELECT @SeatSalt = PasswordSalt, @SeatHash = PasswordHash
+                FROM TexasHoldEm_Public.TexasHoldEm_Identities
+                WHERE IdentityId = @IdentityId;
+
             IF @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave')
             BEGIN
                 SET @Notice = N'You''re not seated at this table, so you can''t do that. Run EXEC sp_TexasHoldEm_Public to join.';
@@ -921,9 +1219,11 @@ BEGIN
                    added here - that stays a hand-boundary thing, so a plain
                    join attempt can't spawn a robot early. */
                 DELETE @Promoted;
-                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
-                SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, Chips)
+                SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime,
+                       w.PasswordSalt, w.PasswordHash, ISNULL(i.Chips, @StartingChips)
                 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist w
+                LEFT JOIN TexasHoldEm_Public.TexasHoldEm_Identities i ON i.PlayerName = w.PlayerName
                 WHERE w.ReservedSeat IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
 
@@ -934,24 +1234,34 @@ BEGIN
                       AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
                 waiters AS (
                     SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+                           Chips = ISNULL(i.Chips, @StartingChips),
                            rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
                     FROM TexasHoldEm_Public.TexasHoldEm_Waitlist w
+                    LEFT JOIN TexasHoldEm_Public.TexasHoldEm_Identities i ON i.PlayerName = w.PlayerName
                     WHERE w.ReservedSeat IS NULL)
-                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
-                SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+                INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, Chips)
+                SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime,
+                       w.PasswordSalt, w.PasswordHash, w.Chips
                 FROM freeseats f JOIN waiters w ON w.rn = f.rn;
 
                 IF EXISTS (SELECT 1 FROM @Promoted)
                 BEGIN
                     INSERT TexasHoldEm_Public.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
                                                     PasswordSalt, PasswordHash, IsBot, Chips)
-                    SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, @StartingChips
+                    SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, Chips
                     FROM @Promoted;
+
+                    UPDATE i
+                       SET PlayerRole = 'PLAYER', WantsSeat = 0, TimedOut = 0,
+                           SessionId = p.SessionId, SessionLoginTime = p.SessionLoginTime,
+                           Chips = p.Chips, LastSeenAt = SYSDATETIME()
+                    FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                    JOIN @Promoted AS p ON p.PlayerName = i.PlayerName;
 
                     DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE WaitId IN (SELECT WaitId FROM @Promoted);
 
                     INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-                    SELECT g.HandNumber, CONCAT(pr.PlayerName, N' is off the waitlist and sits down with ', @StartingChips, N' chips.')
+                    SELECT g.HandNumber, CONCAT(pr.PlayerName, N' is off the waitlist and sits down with ', pr.Chips, N' chips.')
                     FROM @Promoted pr CROSS JOIN TexasHoldEm_Public.TexasHoldEm_Game g;
                 END
 
@@ -987,6 +1297,7 @@ BEGIN
                             SET @PlayerName = CONCAT(N'Player ', @@SPID);
                             IF EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
                                OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                               OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities WHERE PlayerName = @PlayerName)
                                 SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
                                     100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
                         END
@@ -998,13 +1309,34 @@ BEGIN
 
                         IF @ReturnNow = 0
                         BEGIN
-                            SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
-                            SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
-                                 THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                            IF @IdentityFound = 0
+                            BEGIN
+                                SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                                SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                     THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                                SET @JoinChips = @StartingChips;
+                            END
 
                             INSERT TexasHoldEm_Public.TexasHoldEm_Waitlist (PlayerName, SessionId, SessionLoginTime,
                                                              PasswordSalt, PasswordHash, ReservedSeat)
                             VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, @BumpSeat);
+
+                            IF @IdentityFound = 1
+                                UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                                   SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime,
+                                       PlayerRole = 'SPECTATOR', WantsSeat = 1,
+                                       LastSeenAt = SYSDATETIME()
+                                 WHERE IdentityId = @IdentityId;
+                            ELSE
+                            BEGIN
+                                INSERT TexasHoldEm_Public.TexasHoldEm_Identities
+                                    (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash,
+                                     Chips, PlayerRole, WantsSeat, TimedOut)
+                                VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash,
+                                        @JoinChips, 'SPECTATOR', 1, 0);
+                                SET @IdentityId = SCOPE_IDENTITY(); SET @IdentityFound = 1;
+                            END
+                            SET @IdentityRole = 'SPECTATOR'; SET @IdentityChips = @JoinChips;
 
                             SET @IsObserver = 1;
                             SET @Notice = CONCAT(@BumpName, N' is giving up their seat for you at the end of this hand - it''s reserved. Watching from the rail until then - run EXEC sp_TexasHoldEm_Public again to sit down.');
@@ -1036,6 +1368,7 @@ BEGIN
                                 SET @PlayerName = CONCAT(N'Player ', @@SPID);
                                 IF EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
                                    OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                                   OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities WHERE PlayerName = @PlayerName)
                                     SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
                                         100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
                             END
@@ -1047,13 +1380,34 @@ BEGIN
 
                             IF @ReturnNow = 0
                             BEGIN
-                                SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
-                                SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
-                                     THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                                IF @IdentityFound = 0
+                                BEGIN
+                                    SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                                    SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                         THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                                    SET @JoinChips = @StartingChips;
+                                END
 
                                 INSERT TexasHoldEm_Public.TexasHoldEm_Waitlist (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
                                 VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash);
                                 SET @WaitId = SCOPE_IDENTITY();
+
+                                IF @IdentityFound = 1
+                                    UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                                       SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime,
+                                           PlayerRole = 'SPECTATOR', WantsSeat = 1,
+                                           LastSeenAt = SYSDATETIME()
+                                     WHERE IdentityId = @IdentityId;
+                                ELSE
+                                BEGIN
+                                    INSERT TexasHoldEm_Public.TexasHoldEm_Identities
+                                        (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash,
+                                         Chips, PlayerRole, WantsSeat, TimedOut)
+                                    VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash,
+                                            @JoinChips, 'SPECTATOR', 1, 0);
+                                    SET @IdentityId = SCOPE_IDENTITY(); SET @IdentityFound = 1;
+                                END
+                                SET @IdentityRole = 'SPECTATOR'; SET @IdentityChips = @JoinChips;
 
                                 SELECT @WaitPos = COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE WaitId <= @WaitId;
                                 SET @Notice = CONCAT(N'The table''s full. You''re #', @WaitPos, N' on the waitlist',
@@ -1076,6 +1430,7 @@ BEGIN
                            seated or waiting. Don't collide with them. */
                         IF EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE PlayerName = @PlayerName)
                            OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE PlayerName = @PlayerName)
+                           OR EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Identities WHERE PlayerName = @PlayerName)
                             SET @PlayerName = CONCAT(N'Player ', @@SPID, N'-',
                                 100 + ABS(CONVERT(bigint, CHECKSUM(NEWID()))) % 900);
                     END
@@ -1092,13 +1447,34 @@ BEGIN
                         WHERE NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p WHERE p.SeatNum = v.SeatNum)
                         ORDER BY v.SeatNum;
 
-                        SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
-                        SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
-                             THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                        IF @IdentityFound = 0
+                        BEGIN
+                            SET @SeatSalt = CASE WHEN @SeatPassword IS NOT NULL THEN CONVERT(varbinary(16), NEWID()) END;
+                            SET @SeatHash = CASE WHEN @SeatPassword IS NOT NULL
+                                 THEN HASHBYTES('SHA2_256', @SeatSalt + CONVERT(varbinary(100), @SeatPassword)) END;
+                            SET @JoinChips = @StartingChips;
+                        END
 
                         INSERT TexasHoldEm_Public.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
                                                         PasswordSalt, PasswordHash, IsBot, Chips)
-                        VALUES (@MySeat, @PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, 0, @StartingChips);
+                        VALUES (@MySeat, @PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash, 0, @JoinChips);
+
+                        IF @IdentityFound = 1
+                            UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+                               SET SessionId = @@SPID, SessionLoginTime = @MyLoginTime,
+                                   PlayerRole = 'PLAYER', WantsSeat = 0, TimedOut = 0,
+                                   Chips = @JoinChips, LastSeenAt = SYSDATETIME()
+                             WHERE IdentityId = @IdentityId;
+                        ELSE
+                        BEGIN
+                            INSERT TexasHoldEm_Public.TexasHoldEm_Identities
+                                (PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash,
+                                 Chips, PlayerRole, WantsSeat, TimedOut)
+                            VALUES (@PlayerName, @@SPID, @MyLoginTime, @SeatSalt, @SeatHash,
+                                    @JoinChips, 'PLAYER', 0, 0);
+                            SET @IdentityId = SCOPE_IDENTITY(); SET @IdentityFound = 1;
+                        END
+                        SET @IdentityRole = 'PLAYER'; SET @IdentityChips = @JoinChips;
 
                         /* If the waiting table had emptied out, this player is
                            opening a fresh lobby and should get the full join
@@ -1111,8 +1487,8 @@ BEGIN
                         INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                         SELECT HandNumber,
                                CASE WHEN GameState = 'WaitingForPlayers'
-                                    THEN CONCAT(@PlayerName, N' joins the game with ', @StartingChips, N' chips.')
-                                    ELSE CONCAT(@PlayerName, N' sits down with ', @StartingChips,
+                                    THEN CONCAT(@PlayerName, N' joins the game with ', @JoinChips, N' chips.')
+                                    ELSE CONCAT(@PlayerName, N' sits down with ', @JoinChips,
                                          N' chips and will be dealt into the next hand.') END
                         FROM TexasHoldEm_Public.TexasHoldEm_Game;
 
@@ -1276,7 +1652,17 @@ BEGIN
                     INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                     SELECT @GHand, CONCAT(@PlayerName, N' leaves the table with ', Chips, N' chips.')
                     FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE SeatNum = @MySeat;
+                    UPDATE i
+                       SET Chips = p.Chips, PlayerRole = 'SPECTATOR', WantsSeat = 0,
+                           TimedOut = 0, LastSeenAt = SYSDATETIME(),
+                           LastPlayedHand = p.LastPlayedHand,
+                           LastViewedHand = p.LastViewedHand
+                    FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                    JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+                      ON p.PlayerName = i.PlayerName
+                    WHERE p.SeatNum = @MySeat AND p.IsBot = 0;
                     DELETE TexasHoldEm_Public.TexasHoldEm_Players WHERE SeatNum = @MySeat;
+                    SET @IdentityRole = 'SPECTATOR';
                     SET @Notice = N'You''ve left the table. Thanks for playing!';
                 END
                 SET @LeftTable = 1;
@@ -1329,6 +1715,12 @@ BEGIN
               AND LastPlayedHand = @GHand
               AND LastViewedHand < @GHand;
 
+            SELECT @ReturningHumans = COUNT(*)
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities
+            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
+            SET @UnviewedHumans += @ReturningHumans;
+
             /* Keep the completed table and showdown transcript available
                until every still-relevant human participant has received it,
                but never let a disconnected player block beyond the deadline. */
@@ -1347,9 +1739,11 @@ BEGIN
                regulars - the next human to walk up takes a robot's chair
                instead of going to the rail. */
             DELETE @Promoted;
-            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
-            SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, Chips)
+            SELECT w.WaitId, w.ReservedSeat, w.PlayerName, w.SessionId, w.SessionLoginTime,
+                   w.PasswordSalt, w.PasswordHash, ISNULL(i.Chips, @StartingChips)
             FROM TexasHoldEm_Public.TexasHoldEm_Waitlist w
+            LEFT JOIN TexasHoldEm_Public.TexasHoldEm_Identities i ON i.PlayerName = w.PlayerName
             WHERE w.ReservedSeat IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p WHERE p.SeatNum = w.ReservedSeat);
 
@@ -1360,24 +1754,34 @@ BEGIN
                   AND NOT EXISTS (SELECT 1 FROM @Promoted pr WHERE pr.SeatNum = v.SeatNum)),
             waiters AS (
                 SELECT w.WaitId, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash,
+                       Chips = ISNULL(i.Chips, @StartingChips),
                        rn = ROW_NUMBER() OVER (ORDER BY w.WaitId)
                 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist w
+                LEFT JOIN TexasHoldEm_Public.TexasHoldEm_Identities i ON i.PlayerName = w.PlayerName
                 WHERE w.ReservedSeat IS NULL)   /* reserved rows are handled above, on their own seat only */
-            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash)
-            SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime, w.PasswordSalt, w.PasswordHash
+            INSERT @Promoted (WaitId, SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, Chips)
+            SELECT w.WaitId, f.SeatNum, w.PlayerName, w.SessionId, w.SessionLoginTime,
+                   w.PasswordSalt, w.PasswordHash, w.Chips
             FROM freeseats f JOIN waiters w ON w.rn = f.rn;
 
             IF EXISTS (SELECT 1 FROM @Promoted)
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, SessionLoginTime,
                                                 PasswordSalt, PasswordHash, IsBot, Chips)
-                SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, @StartingChips
+                SELECT SeatNum, PlayerName, SessionId, SessionLoginTime, PasswordSalt, PasswordHash, 0, Chips
                 FROM @Promoted;
+
+                UPDATE i
+                   SET PlayerRole = 'PLAYER', WantsSeat = 0, TimedOut = 0,
+                       SessionId = p.SessionId, SessionLoginTime = p.SessionLoginTime,
+                       Chips = p.Chips, LastSeenAt = SYSDATETIME()
+                FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                JOIN @Promoted AS p ON p.PlayerName = i.PlayerName;
 
                 DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE WaitId IN (SELECT WaitId FROM @Promoted);
 
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-                SELECT @GHand, CONCAT(PlayerName, N' is off the waitlist and sits down with ', @StartingChips, N' chips.')
+                SELECT @GHand, CONCAT(PlayerName, N' is off the waitlist and sits down with ', Chips, N' chips.')
                 FROM @Promoted;
             END
 
@@ -1789,13 +2193,37 @@ BEGIN
             FROM TexasHoldEm_Public.TexasHoldEm_Players;
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message) VALUES (@GHand, @Msg);
 
+            /* Bank the authoritative human stacks before removing any chair.
+               Busted identities become OUT; timeout removals keep their chips
+               as SPECTATORs so a password-authenticated return resumes the
+               same bankroll. */
+            UPDATE i
+               SET Chips = p.Chips,
+                   PlayerRole = CASE WHEN p.Chips <= 0 THEN 'OUT'
+                                     WHEN p.WantsToLeave = 1 THEN 'SPECTATOR'
+                                     ELSE 'PLAYER' END,
+                   WantsSeat = 0,
+                   TimedOut = CASE WHEN p.WantsToLeave = 1
+                                         AND p.TimeoutStrikes >= @MaxTimeoutStrikes
+                                   THEN 1 ELSE 0 END,
+                   LastSeenAt = SYSDATETIME(),
+                   LastPlayedHand = p.LastPlayedHand,
+                   LastViewedHand = p.LastViewedHand
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+            JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+              ON p.PlayerName = i.PlayerName
+            WHERE p.IsBot = 0;
+
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-            SELECT @GHand, CONCAT(PlayerName, N' is out of chips and leaves the table.')
+            SELECT @GHand, CONCAT(PlayerName, N' is out of chips and is OUT; the identity cannot rebuy during retention.')
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
             DELETE TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
 
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-            SELECT @GHand, CONCAT(PlayerName, N' cashes out ', Chips, N' chips and leaves.')
+            SELECT @GHand, CONCAT(PlayerName,
+                   CASE WHEN TimeoutStrikes >= @MaxTimeoutStrikes
+                        THEN CONCAT(N' timed out and leaves the seat with ', Chips, N' retained chips.')
+                        ELSE CONCAT(N' cashes out ', Chips, N' chips and leaves.') END)
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE WantsToLeave = 1;
             DELETE TexasHoldEm_Public.TexasHoldEm_Players WHERE WantsToLeave = 1;
 
@@ -1807,21 +2235,29 @@ BEGIN
                    @HumansLeft = ISNULL(SUM(CASE WHEN IsBot = 0 THEN 1 ELSE 0 END), 0)
             FROM TexasHoldEm_Public.TexasHoldEm_Players;
 
+            SELECT @ReturningHumans = COUNT(*)
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities
+            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
+
             /* None of these endings should strand somebody on the waitlist -
                a person still queued for a seat means the game isn't really
                over, it just needs one more hand-start to pull them in. */
-            IF @NumPlayers = 0 AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
+            IF @NumPlayers = 0 AND @ReturningHumans = 0
+               AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message) VALUES (@GHand, N'Everyone''s gone home. GAME OVER.');
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @HumansLeft = 0 AND @NumPlayers > 0 AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
+            ELSE IF @HumansLeft = 0 AND @NumPlayers > 0 AND @ReturningHumans = 0
+                    AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, N'No humans remain. The machines win. GAME OVER.');
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @NumPlayers = 1 AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
+            ELSE IF @NumPlayers = 1 AND @ReturningHumans = 0
+                    AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
             BEGIN
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                 SELECT @GHand, CONCAT(N'*** ', PlayerName, N' WINS IT ALL with ', Chips, N' chips! GAME OVER. ***')
@@ -2087,6 +2523,15 @@ BEGIN
         ) AS h(HoleCards)
         WHERE p.SeatNum = @MySeat;
 
+    IF @IdentityFound = 1
+    BEGIN
+        SELECT @IdentityRole = PlayerRole, @IdentityChips = Chips,
+               @IdentityTimedOut = TimedOut
+        FROM TexasHoldEm_Public.TexasHoldEm_Identities
+        WHERE IdentityId = @IdentityId;
+        IF @SeatExists = 0 SET @MyChips = @IdentityChips;
+    END
+
     SET @MyCards = NULL;
     IF @MyC1 IS NOT NULL
         SELECT @MyCards = CONCAT(c1.Display, N' ', c2.Display)
@@ -2181,6 +2626,13 @@ BEGIN
            SET LastViewedHand = @GHand
          WHERE SeatNum = @MySeat
            AND IsBot = 0
+           AND LastPlayedHand = @GHand
+           AND LastViewedHand < @GHand;
+
+    IF @GState = 'BetweenHands' AND @GHand >= @TargetHand AND @IdentityFound = 1
+        UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+           SET LastViewedHand = @GHand, LastSeenAt = @SnapshotAt
+         WHERE IdentityId = @IdentityId
            AND LastPlayedHand = @GHand
            AND LastViewedHand < @GHand;
 
@@ -2375,10 +2827,23 @@ ELSE IF @IsObserver = 1
     INSERT @Prompt (Line) VALUES
         (N'You''re watching from the rail. Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status'' about every 2 seconds,'),
         (N'or EXEC sp_TexasHoldEm_Public to grab a seat when one opens up.');
+ELSE IF @IdentityRole = 'OUT'
+    INSERT @Prompt (Line) VALUES
+        (CONCAT(N'You are OUT with 0 chips. This identity cannot receive another free stack for ',
+                @OutRetentionMinutes, N' minutes. Watch with @Action = ''Status'' or wait for a fresh game.'));
+ELSE IF @IdentityRole = 'SPECTATOR' AND @IdentityTimedOut = 1
+    INSERT @Prompt (Line) VALUES
+        (CONCAT(N'Your timed-out identity still has ', @IdentityChips,
+                N' chips. Run EXEC sp_TexasHoldEm_Public', STUFF(@NameArg, 1, 2, N' '),
+                N' with your @SeatPassword to request a seat and resume that stack.'));
+ELSE IF @IdentityRole = 'SPECTATOR'
+    INSERT @Prompt (Line) VALUES
+        (CONCAT(N'You have ', @IdentityChips,
+                N' retained chips off-table. Run EXEC sp_TexasHoldEm_Public', STUFF(@NameArg, 1, 2, N' '),
+                N' with your @SeatPassword to request a seat.'));
 ELSE IF @MySeat IS NOT NULL AND @SeatExists = 0
     INSERT @Prompt (Line) VALUES
-        (N'You''re out - busted or removed. Run EXEC sp_TexasHoldEm_Public to buy back in if a seat is open,'),
-        (N'or EXEC sp_TexasHoldEm_Public @Action = ''Watch'' to spectate with dignity.');
+        (N'Your seat is gone. Run EXEC sp_TexasHoldEm_Public @Action = ''Status'' to watch the table.');
 ELSE IF @GState = 'WaitingForPlayers'
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'Waiting for players until ', CONVERT(nvarchar(8), @JoinEnds, 108),
