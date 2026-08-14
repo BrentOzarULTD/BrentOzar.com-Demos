@@ -415,6 +415,7 @@ DECLARE @rc int,
            board when this call picked the game up. */
         @TurnStartLogId int = 0,
         @GameStartLogId int = 0,
+        @ResponseLogUpper int = 0,
         @CardsShownForHand int = -1,
         /* game snapshot */
         @GState varchar(20), @GHand int, @Dealer tinyint, @SBSeat tinyint, @BBSeat tinyint,
@@ -423,6 +424,7 @@ DECLARE @rc int,
         @JoinEnds datetime2, @NextHandAt datetime2,
         @B1 tinyint, @B2 tinyint, @B3 tinyint, @B4 tinyint, @B5 tinyint,
         @BoardDisp nvarchar(30),
+        @TurnPlayerName nvarchar(30), @SnapshotAt datetime2,
         /* my seat snapshot */
         @SeatExists bit, @CurOwner int, @CurLoginTime datetime2,
         @SeatSalt varbinary(16), @SeatHash varbinary(32),
@@ -459,6 +461,18 @@ DECLARE @FRanks TABLE (CardRank int);
 DECLARE @ShowResults TABLE (SeatNum tinyint, PlayerName nvarchar(30), Score bigint, HandName nvarchar(60));
 DECLARE @Prompt TABLE (LineId int IDENTITY(1,1), Line nvarchar(300));
 DECLARE @Happened TABLE (LogId int, Message nvarchar(500));
+DECLARE @PlayerSnapshot TABLE
+(
+    SeatNum tinyint PRIMARY KEY,
+    PlayerName nvarchar(30) NOT NULL,
+    IsBot bit NOT NULL,
+    Chips int NOT NULL,
+    BetThisRound int NOT NULL,
+    InHand bit NOT NULL,
+    Folded bit NOT NULL,
+    AllIn bit NOT NULL,
+    Cards nvarchar(12) NOT NULL
+);
 DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30),
     SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32));
 
@@ -2037,10 +2051,16 @@ BEGIN
     /* ================================================================
        Snapshot the world for this session, then let go of the lock.
        ================================================================ */
-    SELECT @GState = GameState, @GHand = HandNumber, @TurnSeat = TurnSeat,
-           @TurnStartedAt = TurnStartedAt, @Round = BettingRound, @Pot = Pot,
-           @BetToCall = BetToCall, @RaiseCount = RaiseCount, @BoardShown = BoardShown
+    SELECT @GState = GameState, @GHand = HandNumber, @Dealer = DealerSeat,
+           @SBSeat = SmallBlindSeat, @BBSeat = BigBlindSeat,
+           @TurnSeat = TurnSeat, @TurnStartedAt = TurnStartedAt,
+           @Round = BettingRound, @Pot = Pot, @BetToCall = BetToCall,
+           @RaiseCount = RaiseCount, @BoardShown = BoardShown,
+           @ShowdownShown = ShowdownShown, @JoinEnds = JoinWindowEndsAt,
+           @NextHandAt = NextHandStartsAt,
+           @B1 = Board1, @B2 = Board2, @B3 = Board3, @B4 = Board4, @B5 = Board5
     FROM TexasHoldEm_Public.TexasHoldEm_Game;
+    SET @SnapshotAt = SYSDATETIME();
 
     SET @SeatExists = 0; SET @CurOwner = NULL; SET @CurLoginTime = NULL;
     SET @MyNeedsToAct = 0; SET @MyFolded = 0;
@@ -2067,10 +2087,91 @@ BEGIN
         ) AS h(HoleCards)
         WHERE p.SeatNum = @MySeat;
 
+    SET @MyCards = NULL;
+    IF @MyC1 IS NOT NULL
+        SELECT @MyCards = CONCAT(c1.Display, N' ', c2.Display)
+        FROM #Poker_Cards AS c1
+        CROSS JOIN #Poker_Cards AS c2
+        WHERE c1.CardId = @MyC1 AND c2.CardId = @MyC2;
+
+    /* Freeze the viewer-specific seat grid while the applock is held. The
+       decryption predicate is deliberately inside the snapshot query: after
+       COMMIT, rendering cannot accidentally broaden card visibility. */
+    DELETE @PlayerSnapshot;
+    INSERT @PlayerSnapshot
+        (SeatNum, PlayerName, IsBot, Chips, BetThisRound, InHand, Folded, AllIn, Cards)
+    SELECT p.SeatNum, p.PlayerName, p.IsBot, p.Chips, p.BetThisRound,
+           p.InHand, p.Folded, p.AllIn,
+           CASE WHEN h.HoleCards IS NOT NULL
+                     THEN CONCAT(c1.Display, N' ', c2.Display)
+                WHEN p.InHand = 1 AND p.Folded = 0 AND p.HoleCardsEncrypted IS NOT NULL
+                     THEN N'[hidden]'
+                ELSE N'' END
+    FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+    OUTER APPLY
+    (
+        SELECT CONVERT(varbinary(2), DecryptByCert
+        (
+            CERT_ID(N'sp_TexasHoldEm_CardProtection_Claude'),
+            p.HoleCardsEncrypted,
+            N'Cl@udeTexasH0ldEm_2026!Cards'
+        )) AS HoleCards
+        WHERE p.HoleCardsEncrypted IS NOT NULL
+          AND
+          (
+              p.SeatNum = @MySeat
+              OR (p.InHand = 1 AND p.Folded = 0 AND @ShowdownShown = 1
+                  AND @GState IN ('BetweenHands', 'GameOver'))
+          )
+    ) AS h
+    LEFT JOIN #Poker_Cards AS c1
+      ON c1.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 1, 1))
+    LEFT JOIN #Poker_Cards AS c2
+      ON c2.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1));
+
+    SET @TurnPlayerName = NULL;
+    SELECT @TurnPlayerName = PlayerName
+    FROM @PlayerSnapshot
+    WHERE SeatNum = @TurnSeat;
+
     DELETE @NewLog;
     INSERT @NewLog (LogId, Message)
     SELECT LogId, Message FROM TexasHoldEm_Public.TexasHoldEm_Log WHERE LogId > @LastLogId;
     SELECT @LastLogId = ISNULL(MAX(LogId), @LastLogId) FROM @NewLog;
+
+    /* Freeze the requested transcript with explicit lower and upper bounds.
+       ThisTurn remains the bounded default; the permanent log itself is
+       trimmed to 300 rows, so the opt-in wider views are bounded too. */
+    DELETE @Happened;
+    SET @ResponseLogUpper = @LastLogId;
+
+    IF @ShowWhatHappened = N'ThisTurn'
+        INSERT @Happened (LogId, Message)
+        SELECT LogId, Message
+        FROM TexasHoldEm_Public.TexasHoldEm_Log
+        WHERE LogId > @TurnStartLogId AND LogId <= @ResponseLogUpper;
+    ELSE IF @ShowWhatHappened = N'ThisGame'
+    BEGIN
+        SELECT @GameStartLogId = ISNULL(MAX(x.LogId), 0)
+        FROM
+        (
+            SELECT LogId, HandNumber,
+                   PrevHand = LAG(HandNumber) OVER (ORDER BY LogId)
+            FROM TexasHoldEm_Public.TexasHoldEm_Log
+            WHERE LogId <= @ResponseLogUpper
+        ) AS x
+        WHERE x.PrevHand IS NOT NULL AND x.HandNumber < x.PrevHand;
+
+        INSERT @Happened (LogId, Message)
+        SELECT LogId, Message
+        FROM TexasHoldEm_Public.TexasHoldEm_Log
+        WHERE LogId >= @GameStartLogId AND LogId <= @ResponseLogUpper;
+    END
+    ELSE
+        INSERT @Happened (LogId, Message)
+        SELECT LogId, Message
+        FROM TexasHoldEm_Public.TexasHoldEm_Log
+        WHERE LogId >= 0 AND LogId <= @ResponseLogUpper;
 
     /* A BetweenHands response contains this hand's final table and transcript.
        Acknowledge only this viewer and only the hand captured above. The next
@@ -2158,44 +2259,11 @@ END /* main wait loop */
    purpose - the play-by-play can run long, and nobody should have to
    scroll past it to find out what to type.
    ================================================================ */
-IF @GameGone = 1 OR NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Game)
+IF @GameGone = 1
 BEGIN
     SELECT [House Fire] = N'The game tables vanished mid-hand. Players can''t do that anymore, so ask your admin what they just dropped. Re-run the setup script to rebuild the casino.';
     RETURN;
 END
-
-SELECT @GState = GameState, @GHand = HandNumber, @Dealer = DealerSeat,
-       @SBSeat = SmallBlindSeat, @BBSeat = BigBlindSeat, @Round = BettingRound,
-       @BoardShown = BoardShown, @ShowdownShown = ShowdownShown, @Pot = Pot,
-       @BetToCall = BetToCall, @RaiseCount = RaiseCount, @TurnSeat = TurnSeat,
-       @TurnStartedAt = TurnStartedAt, @JoinEnds = JoinWindowEndsAt,
-       @B1 = Board1, @B2 = Board2, @B3 = Board3, @B4 = Board4, @B5 = Board5
-FROM TexasHoldEm_Public.TexasHoldEm_Game;
-
-SET @SeatExists = 0; SET @MyNeedsToAct = 0; SET @MyFolded = 0; SET @MyInHand = 0;
-SET @MyC1 = NULL; SET @MyC2 = NULL; SET @MyChips = NULL; SET @MyBet = 0; SET @MyCards = NULL;
-IF @MySeat IS NOT NULL
-    SELECT @SeatExists = 1, @MyNeedsToAct = NeedsToAct, @MyFolded = Folded, @MyInHand = InHand,
-           @MyC1 = CONVERT(tinyint, SUBSTRING(h.HoleCards, 1, 1)),
-           @MyC2 = CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1)),
-           @MyChips = Chips, @MyBet = BetThisRound
-    FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
-    OUTER APPLY
-    (
-        VALUES
-        (
-            CONVERT(varbinary(2), DecryptByCert
-            (
-                CERT_ID(N'sp_TexasHoldEm_CardProtection_Claude'),
-                p.HoleCardsEncrypted,
-                N'Cl@udeTexasH0ldEm_2026!Cards'
-            ))
-        )
-    ) AS h(HoleCards)
-    WHERE p.SeatNum = @MySeat;
-IF @MyC1 IS NOT NULL
-    SELECT @MyCards = CONCAT(c1.Display, N' ', c2.Display)
-    FROM #Poker_Cards c1 CROSS JOIN #Poker_Cards c2 WHERE c1.CardId = @MyC1 AND c2.CardId = @MyC2;
 
 SET @BoardDisp = NULL;
 SELECT @BoardDisp = STRING_AGG(c.Display, N' ') WITHIN GROUP (ORDER BY b.ord)
@@ -2203,7 +2271,7 @@ FROM (VALUES (1, @B1), (2, @B2), (3, @B3), (4, @B4), (5, @B5)) b(ord, cid)
 JOIN #Poker_Cards c ON c.CardId = b.cid
 WHERE b.ord <= @BoardShown;
 
-SET @PotDisp = @Pot + ISNULL((SELECT SUM(BetThisRound) FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE InHand = 1), 0);
+SET @PotDisp = @Pot + ISNULL((SELECT SUM(BetThisRound) FROM @PlayerSnapshot WHERE InHand = 1), 0);
 
 /* Result 1: the table at a glance. */
 SELECT [Hand #] = NULLIF(@GHand, 0),
@@ -2232,37 +2300,13 @@ SELECT [Seat] = p.SeatNum,
                          ELSE N'' END,
        [Chips] = p.Chips,
        [This Round] = p.BetThisRound,
-       [Cards] = CASE WHEN p.SeatNum = @MySeat THEN ISNULL(@MyCards, N'')
-                      WHEN p.InHand = 1 AND p.Folded = 0 AND @ShowdownShown = 1
-                           AND @GState IN ('BetweenHands', 'GameOver')
-                           THEN (SELECT CONCAT(c1.Display, N' ', c2.Display)
-                                 FROM #Poker_Cards c1 CROSS JOIN #Poker_Cards c2
-                                 WHERE c1.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 1, 1))
-                                   AND c2.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1)))
-                      WHEN p.InHand = 1 AND p.Folded = 0 AND p.HoleCardsEncrypted IS NOT NULL THEN N'[hidden]'
-                      ELSE N'' END,
+       [Cards] = p.Cards,
        [Status] = CASE WHEN p.Folded = 1 THEN N'Folded'
                        WHEN p.AllIn = 1 THEN N'ALL IN'
                        WHEN @GState = 'InHand' AND p.SeatNum = @TurnSeat THEN N'<<< deciding'
                        WHEN @GState = 'InHand' AND p.InHand = 0 THEN N'Sitting out this hand'
                        ELSE N'' END
-FROM TexasHoldEm_Public.TexasHoldEm_Players p
-OUTER APPLY
-(
-    SELECT CONVERT(varbinary(2), DecryptByCert
-    (
-        CERT_ID(N'sp_TexasHoldEm_CardProtection_Claude'),
-        p.HoleCardsEncrypted,
-        N'Cl@udeTexasH0ldEm_2026!Cards'
-    )) AS HoleCards
-    WHERE p.HoleCardsEncrypted IS NOT NULL
-      AND
-      (
-          p.SeatNum = @MySeat
-          OR (p.InHand = 1 AND p.Folded = 0 AND @ShowdownShown = 1
-              AND @GState IN ('BetweenHands', 'GameOver'))
-      )
-) AS h
+FROM @PlayerSnapshot AS p
 ORDER BY p.SeatNum;
 
 /* Result 3: what to do now. Never echo @SeatPassword back - results get
@@ -2292,7 +2336,7 @@ BEGIN
     SET @Owed = @BetToCall - @MyBet;
     SET @Unit = CASE WHEN @Round <= 1 THEN @SmallBet ELSE @BigBet END;
     SET @NewBet = CASE WHEN @BetToCall = 0 THEN @Unit ELSE @BetToCall + @Unit END;
-    SET @SecondsLeft = @TurnSeconds - DATEDIFF(second, @TurnStartedAt, SYSDATETIME());
+    SET @SecondsLeft = @TurnSeconds - DATEDIFF(second, @TurnStartedAt, @SnapshotAt);
     IF @SecondsLeft < 0 SET @SecondsLeft = 0;
 
     INSERT @Prompt (Line) VALUES
@@ -2342,7 +2386,7 @@ ELSE IF @GState = 'WaitingForPlayers'
         (N'Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status''; lobby polling can be slower than every 2 seconds.');
 ELSE IF @WaitForTurn = 0 AND @GState = 'InHand' AND @SeatExists = 1
     INSERT @Prompt (Line) VALUES
-        (CONCAT(N'Waiting for ', ISNULL((SELECT PlayerName FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE SeatNum = @TurnSeat), N'the next player'),
+        (CONCAT(N'Waiting for ', ISNULL(@TurnPlayerName, N'the next player'),
                 N'. Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status'' about every 2 seconds.'));
 ELSE IF @SeatExists = 1
     INSERT @Prompt (Line) VALUES
@@ -2353,37 +2397,7 @@ ELSE
 
 SELECT [What Now] = Line FROM @Prompt ORDER BY LineId;
 
-/* Result 4: the play-by-play. ThisTurn - the default - is the action since
-   you last ran a query, because that's the part you missed. It's bounded on
-   BOTH ends on purpose: @TurnStartLogId is where this call started reading
-   (including the short backlog the proc streams for context), and
-   @LastLogId is the last line this call actually streamed. Without the
-   upper bound, a busy table could write new lines between the final COMMIT
-   and this query, and the grid would show action the Messages tab never
-   did. The log outlives games, so ThisGame has to find where the current
-   one started: a new game resets HandNumber to 0, so the boundary is the
-   last place the hand number went backwards. No string matching on log
-   messages - those are prose, and prose gets edited. */
-DELETE @Happened;
-
-IF @ShowWhatHappened = N'ThisTurn'
-    INSERT @Happened (LogId, Message)
-    SELECT LogId, Message FROM TexasHoldEm_Public.TexasHoldEm_Log
-     WHERE LogId > @TurnStartLogId AND LogId <= @LastLogId;
-ELSE IF @ShowWhatHappened = N'ThisGame'
-BEGIN
-    SELECT @GameStartLogId = ISNULL(MAX(x.LogId), 0)
-    FROM (SELECT LogId, HandNumber,
-                 PrevHand = LAG(HandNumber) OVER (ORDER BY LogId)
-          FROM TexasHoldEm_Public.TexasHoldEm_Log) x
-    WHERE x.PrevHand IS NOT NULL AND x.HandNumber < x.PrevHand;
-
-    INSERT @Happened (LogId, Message)
-    SELECT LogId, Message FROM TexasHoldEm_Public.TexasHoldEm_Log WHERE LogId >= @GameStartLogId;
-END
-ELSE
-    INSERT @Happened (LogId, Message)
-    SELECT LogId, Message FROM TexasHoldEm_Public.TexasHoldEm_Log;
+/* Result 4: the play-by-play frozen under the same lock as results 1-3. */
 
 IF NOT EXISTS (SELECT 1 FROM @Happened)
     INSERT @Happened (LogId, Message)
