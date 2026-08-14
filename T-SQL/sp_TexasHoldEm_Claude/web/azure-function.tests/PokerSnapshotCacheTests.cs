@@ -62,6 +62,20 @@ public sealed class PokerSnapshotCacheTests
             cache.GetAsync(CancellationToken.None));
     }
 
+    [Fact]
+    public async Task GetAsync_DoesNotPassARequestCancellationTokenToTheSharedRefresh()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.Zero);
+        var cache = CreateCache(source, time, 17);
+        using var requestCancellation = new CancellationTokenSource();
+
+        await cache.GetAsync(requestCancellation.Token);
+
+        Assert.False(source.LastCancellationToken.CanBeCanceled);
+        Assert.Equal(17, cache.CacheSeconds);
+    }
+
     private static PokerSnapshotCache CreateCache(
         IPokerSnapshotSource source,
         TimeProvider timeProvider,
@@ -95,10 +109,12 @@ public sealed class PokerSnapshotCacheTests
 
         public int CallCount => Volatile.Read(ref _callCount);
         public bool Fail { get; set; }
+        public CancellationToken LastCancellationToken { get; private set; }
 
         public async Task<PokerSnapshot> LoadAsync(CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _callCount);
+            LastCancellationToken = cancellationToken;
             await Task.Delay(_delay, cancellationToken);
             if (Fail)
             {

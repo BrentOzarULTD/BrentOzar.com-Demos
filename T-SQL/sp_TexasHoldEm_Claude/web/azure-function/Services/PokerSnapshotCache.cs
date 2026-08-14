@@ -31,8 +31,11 @@ public sealed class PokerSnapshotCache
             throw new InvalidOperationException("PokerCacheSeconds must be between 1 and 300.");
         }
 
+        CacheSeconds = cacheSeconds;
         _ttl = TimeSpan.FromSeconds(cacheSeconds);
     }
+
+    public int CacheSeconds { get; }
 
     public async Task<PokerSnapshot> GetAsync(CancellationToken cancellationToken)
     {
@@ -47,7 +50,9 @@ public sealed class PokerSnapshotCache
 
             try
             {
-                var refreshed = await _source.LoadAsync(cancellationToken);
+                // A disconnected HTTP client must not cancel a refresh shared by the whole Function instance.
+                // SqlPokerSnapshotSource still bounds this work with PokerCommandTimeoutSeconds.
+                var refreshed = await _source.LoadAsync(CancellationToken.None);
                 _snapshot = refreshed with { Stale = false };
                 _expiresAt = _timeProvider.GetUtcNow().Add(_ttl);
                 return _snapshot;

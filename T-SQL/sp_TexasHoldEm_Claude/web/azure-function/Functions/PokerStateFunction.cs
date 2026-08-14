@@ -32,12 +32,12 @@ public sealed class PokerStateFunction
                 && values.Any(value => string.Equals(value, etag, StringComparison.Ordinal)))
             {
                 var notModified = request.CreateResponse(HttpStatusCode.NotModified);
-                AddCacheHeaders(notModified, etag);
+                AddCacheHeaders(notModified, etag, _cache.CacheSeconds);
                 return notModified;
             }
 
             var response = request.CreateResponse(HttpStatusCode.OK);
-            AddCacheHeaders(response, etag);
+            AddCacheHeaders(response, etag, _cache.CacheSeconds);
             await response.WriteAsJsonAsync(snapshot, cancellationToken);
             return response;
         }
@@ -57,9 +57,12 @@ public sealed class PokerStateFunction
         }
     }
 
-    private static void AddCacheHeaders(HttpResponseData response, string etag)
+    private static void AddCacheHeaders(HttpResponseData response, string etag, int cacheSeconds)
     {
-        response.Headers.Add("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
+        response.Headers.Add(
+            "Cache-Control",
+            FormattableString.Invariant(
+                $"public, max-age={cacheSeconds}, stale-while-revalidate={cacheSeconds * 3}"));
         response.Headers.Add("ETag", etag);
     }
 }
