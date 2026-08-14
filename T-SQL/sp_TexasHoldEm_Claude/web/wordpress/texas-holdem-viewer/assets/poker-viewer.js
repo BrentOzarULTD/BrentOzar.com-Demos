@@ -91,9 +91,15 @@
 
             try {
                 const response = await window.fetch(endpoint, {
+                    cache: 'no-store',
                     headers: { Accept: 'application/json' },
                     signal: controller.signal
                 });
+                if (response.status === 304) {
+                    status.textContent = 'No changes since the last update. Refreshes every 10 seconds.';
+                    return;
+                }
+
                 if (!response.ok) {
                     throw new Error('API returned HTTP ' + response.status);
                 }
