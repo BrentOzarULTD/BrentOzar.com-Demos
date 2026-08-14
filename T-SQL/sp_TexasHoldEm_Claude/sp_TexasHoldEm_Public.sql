@@ -99,6 +99,16 @@ HOW TO PLAY
         EXEC sp_TexasHoldEm_Public @Action = 'Fold',  @PlayerName = 'Brent';
      After a hand ends, run EXEC sp_TexasHoldEm_Public again to keep playing.
 
+     Applications and scripts can opt out of the streaming wait:
+        EXEC sp_TexasHoldEm_Public @PlayerName = 'Brent', @WaitForTurn = 0;
+        EXEC sp_TexasHoldEm_Public @Action = 'Status';
+     A non-blocking call advances every transition that is ready, returns the
+     same four result sets, and stops when the engine reaches a human decision
+     or future deadline. Poll Status about every 2 seconds while active and
+     less often in the lobby. Use a client command timeout of at least 30
+     seconds so a busy table's 15-second applock timeout can be reported.
+     Status is always non-blocking regardless of @WaitForTurn.
+
   4. Every call hands back four result sets, in this order: Hand (the table
      at a glance), Seat (who's sitting where), What Now (the exact commands
      to run next), and What Happened (the play-by-play). By default, What
@@ -328,6 +338,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_TexasHoldEm_Public
     @Action nvarchar(20) = NULL,
     @PlayerName nvarchar(30) = NULL,
     @SeatPassword nvarchar(50) = NULL,
+    /* 1 preserves the SSMS streaming wait. 0 processes ready work once and
+       returns for polling clients without executing WAITFOR. */
+    @WaitForTurn bit = 1,
     /* How much of the play-by-play to show in the What Happened result set:
        ThisTurn (default), ThisGame, or AllHistory. */
     @ShowWhatHappened nvarchar(20) = N'ThisTurn'
@@ -448,11 +461,14 @@ INSERT #Poker_RankNames (RankValue, RankName, RankPlural) VALUES
 SET @Action = NULLIF(LTRIM(RTRIM(@Action)), N'');
 SET @PlayerName = NULLIF(LTRIM(RTRIM(@PlayerName)), N'');
 SET @SeatPassword = NULLIF(@SeatPassword, N'');
+SET @WaitForTurn = ISNULL(@WaitForTurn, 1);
 SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
 IF @Action = N'Join' SET @Action = NULL;
 /* Nobody types the same thing twice under pressure. Take all of them. */
 IF @Action COLLATE Latin1_General_100_CI_AS IN (N'All In', N'All-In', N'All_In', N'Shove', N'Jam')
     SET @Action = N'AllIn';
+IF @Action COLLATE Latin1_General_100_CI_AS = N'Status'
+    SET @WaitForTurn = 0;
 
 /* Explicit CI collation so this behaves the same on a case-sensitive
    database - the value picks a code path, so it can't drift with collation. */
@@ -1998,6 +2014,7 @@ BEGIN
     IF @GState = 'InHand' AND @SeatExists = 1 AND @TurnSeat = @MySeat
        AND @MyNeedsToAct = 1 AND @MyFolded = 0 BREAK;                          /* your move! */
     IF @GState = 'BetweenHands' AND @GHand >= @TargetHand BREAK;               /* hand's over */
+    IF @WaitForTurn = 0 BREAK;                                                  /* polling client */
     IF DATEDIFF(minute, @WaitStart, SYSDATETIME()) >= @MaxWaitMinutes
     BEGIN
         SET @GaveUp = 1;
@@ -2198,7 +2215,7 @@ BEGIN
 END
 ELSE IF @IsObserver = 1
     INSERT @Prompt (Line) VALUES
-        (N'You''re watching from the rail. Run EXEC sp_TexasHoldEm_Public @Action = ''Watch'' to keep watching,'),
+        (N'You''re watching from the rail. Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status'' about every 2 seconds,'),
         (N'or EXEC sp_TexasHoldEm_Public to grab a seat when one opens up.');
 ELSE IF @MySeat IS NOT NULL AND @SeatExists = 0
     INSERT @Prompt (Line) VALUES
@@ -2207,7 +2224,12 @@ ELSE IF @MySeat IS NOT NULL AND @SeatExists = 0
 ELSE IF @GState = 'WaitingForPlayers'
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'Waiting for players until ', CONVERT(nvarchar(8), @JoinEnds, 108),
-                N' (UTC-ish server time). Run EXEC sp_TexasHoldEm_Public in other sessions to join, then run it again here.'));
+                N' (UTC-ish server time). Run EXEC sp_TexasHoldEm_Public in other sessions to join.')),
+        (N'Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status''; lobby polling can be slower than every 2 seconds.');
+ELSE IF @WaitForTurn = 0 AND @GState = 'InHand' AND @SeatExists = 1
+    INSERT @Prompt (Line) VALUES
+        (CONCAT(N'Waiting for ', ISNULL((SELECT PlayerName FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE SeatNum = @TurnSeat), N'the next player'),
+                N'. Poll with EXEC sp_TexasHoldEm_Public @Action = ''Status'' about every 2 seconds.'));
 ELSE IF @SeatExists = 1
     INSERT @Prompt (Line) VALUES
         (CONCAT(N'Hand #', @GHand, N' is done. Run EXEC sp_TexasHoldEm_Public', STUFF(@NameArg, 1, 2, N' '), N' to play the next hand.'));

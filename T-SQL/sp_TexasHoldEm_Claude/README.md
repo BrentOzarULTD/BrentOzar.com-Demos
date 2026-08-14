@@ -50,6 +50,13 @@ Two builds live in this folder:
 
    After each hand, run `EXEC sp_TexasHoldEm` again to keep playing.
 
+The public procedure also supports polling clients. Pass `@WaitForTurn = 0`
+to process all currently ready transitions and return immediately, or use
+`@Action = 'Status'`, which is always non-blocking. Poll about every two
+seconds during a hand and less often in the lobby. A 30-second client command
+timeout leaves room for the procedure's 15-second busy-table lock timeout.
+The four result sets keep the same order and shape in both modes.
+
 ## Actions
 
 | Action | What it does |
