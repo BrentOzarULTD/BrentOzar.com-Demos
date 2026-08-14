@@ -1199,7 +1199,7 @@ BEGIN
 
         /* Which hand am I waiting to see finish? */
         SELECT @GState = GameState, @GHand = HandNumber FROM TexasHoldEm_Public.TexasHoldEm_Game;
-        SET @TargetHand = CASE WHEN @GState = 'InHand' THEN @GHand ELSE @GHand + 1 END;
+        SET @TargetHand = CASE WHEN @GState IN ('InHand', 'BetweenHands') THEN @GHand ELSE @GHand + 1 END;
     END /* first pass */
 
     /* ================================================================
@@ -2002,7 +2002,7 @@ BEGIN
     /* A BetweenHands response contains this hand's final table and transcript.
        Acknowledge only this viewer and only the hand captured above. The next
        invocation may then advance once every relevant human has checked in. */
-    IF @GState = 'BetweenHands' AND @MySeat IS NOT NULL
+    IF @GState = 'BetweenHands' AND @GHand >= @TargetHand AND @MySeat IS NOT NULL
         UPDATE TexasHoldEm_Public.TexasHoldEm_Players
            SET LastViewedHand = @GHand
          WHERE SeatNum = @MySeat
