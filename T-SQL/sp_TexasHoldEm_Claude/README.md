@@ -16,6 +16,10 @@ Two builds live in this folder:
   [Hosting for the public](#hosting-for-the-public-sp_texasholdem_public)
   below.
 
+A plumbing-first Azure Function and WordPress live viewer proof of concept is
+in **[web/](web/README.md)**. It calls the public procedure in non-blocking
+spectator mode and refreshes a WordPress page without a full-page reload.
+
 ## Quick start
 
 1. Create [sp_TexasHoldEm.sql](sp_TexasHoldEm.sql) in any user database.

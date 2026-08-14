@@ -1,0 +1,6 @@
+azure-function/bin/
+azure-function/obj/
+azure-function/local.settings.json
+azure-function.tests/bin/
+azure-function.tests/obj/
+artifacts/
