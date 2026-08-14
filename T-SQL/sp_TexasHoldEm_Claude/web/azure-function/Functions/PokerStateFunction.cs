@@ -63,6 +63,7 @@ public sealed class PokerStateFunction
             "Cache-Control",
             FormattableString.Invariant(
                 $"public, max-age={cacheSeconds}, stale-while-revalidate={cacheSeconds * 3}"));
+        response.Headers.Add("Access-Control-Expose-Headers", "ETag");
         response.Headers.Add("ETag", etag);
     }
 }

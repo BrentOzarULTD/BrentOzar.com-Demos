@@ -22,6 +22,14 @@ test('parseCards understands design codes and turns hidden text into card backs'
     assert.deepEqual(viewer.parseCards('[hidden]', 2), [null, null]);
 });
 
+test('requestHeaders adds the last server ETag only after one is available', function () {
+    assert.deepEqual(viewer.requestHeaders(null), { Accept: 'application/json' });
+    assert.deepEqual(viewer.requestHeaders('"snapshot-47"'), {
+        Accept: 'application/json',
+        'If-None-Match': '"snapshot-47"'
+    });
+});
+
 test('normalizeStage translates procedure stages into table labels', function () {
     assert.equal(viewer.normalizeStage('Pre-flop betting'), 'Pre-Flop');
     assert.equal(viewer.normalizeStage('Flop betting'), 'The Flop');

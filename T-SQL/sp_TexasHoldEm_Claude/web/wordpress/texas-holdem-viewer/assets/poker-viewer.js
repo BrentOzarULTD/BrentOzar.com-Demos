@@ -63,6 +63,14 @@
         return '$' + Math.max(0, finiteNumber(value)).toLocaleString('en-US');
     }
 
+    function requestHeaders(etag) {
+        const headers = { Accept: 'application/json' };
+        if (typeof etag === 'string' && etag.trim()) {
+            headers['If-None-Match'] = etag;
+        }
+        return headers;
+    }
+
     function parseCard(value) {
         if (value === null || value === undefined) {
             return null;
@@ -496,6 +504,7 @@
 
         const endpoint = viewer.dataset.endpoint;
         let lastGame = null;
+        let etag = null;
 
         const fitTable = function () {
             fit(viewer);
@@ -517,7 +526,7 @@
             try {
                 const response = await windowObject.fetch(endpoint, {
                     cache: 'no-cache',
-                    headers: { Accept: 'application/json' },
+                    headers: requestHeaders(etag),
                     signal: controller.signal
                 });
                 if (response.status === 304) {
@@ -532,6 +541,10 @@
                     throw new Error('API returned HTTP ' + response.status);
                 }
 
+                const responseEtag = response.headers.get('ETag');
+                if (responseEtag) {
+                    etag = responseEtag;
+                }
                 const snapshot = await response.json();
                 lastGame = render(viewer, snapshot);
                 updateStatus(viewer, lastGame, snapshot.stale === true ? 'stale' : 'live');
@@ -563,6 +576,7 @@
         normalizeStatus: normalizeStatus,
         parseCard: parseCard,
         parseCards: parseCards,
+        requestHeaders: requestHeaders,
         render: render,
         statusText: statusText
     };
