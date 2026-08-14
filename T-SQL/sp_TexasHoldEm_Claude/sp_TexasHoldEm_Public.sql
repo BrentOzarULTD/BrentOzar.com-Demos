@@ -1717,7 +1717,8 @@ BEGIN
 
             SELECT @ReturningHumans = COUNT(*)
             FROM TexasHoldEm_Public.TexasHoldEm_Identities
-            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0;
+            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
             SET @UnviewedHumans += @ReturningHumans;
 
             /* Keep the completed table and showdown transcript available
@@ -2205,6 +2206,7 @@ BEGIN
                    TimedOut = CASE WHEN p.WantsToLeave = 1
                                          AND p.TimeoutStrikes >= @MaxTimeoutStrikes
                                    THEN 1 ELSE 0 END,
+                   LastSeenAt = SYSDATETIME(),
                    LastPlayedHand = p.LastPlayedHand,
                    LastViewedHand = p.LastViewedHand
             FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
@@ -2235,7 +2237,8 @@ BEGIN
 
             SELECT @ReturningHumans = COUNT(*)
             FROM TexasHoldEm_Public.TexasHoldEm_Identities
-            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0;
+            WHERE PlayerRole = 'SPECTATOR' AND TimedOut = 1 AND Chips > 0
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
 
             /* None of these endings should strand somebody on the waitlist -
                a person still queued for a seat means the game isn't really
