@@ -691,15 +691,17 @@ IF @Action = N'Reset'
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
    impersonate other players with, no consecutive spaces to fake a lookalike. */
-/* The literal characters lead this bracket list on purpose. Under a binary
-   collation, SQL Server's LIKE drops a trailing literal underscore or dash
-   from a character class when it follows adjacent A-Z/a-z/0-9 ranges
-   (reproduced directly against the engine), so the old ordering rejected
-   every legitimate name containing either character - exactly the names the
-   message below promises are fine. Leading with the literals sidesteps the
-   engine behavior; this is not cosmetic reordering. */
+/* Every literal leads this bracket list on purpose, dash included. Under a
+   binary collation, SQL Server's LIKE drops a literal underscore or dash
+   from a character class when it trails adjacent A-Z/a-z/0-9 ranges
+   (reproduced directly against the engine), so the old
+   '[^A-Za-z0-9 ._-]' ordering rejected every legitimate name containing
+   either character - exactly the names the message below promises are
+   fine. A '-' immediately after the '^' can't be read as a range
+   boundary, so it is unambiguously literal. This is not cosmetic
+   reordering. */
 IF @PlayerName IS NOT NULL
-   AND (@PlayerName LIKE N'%[^_ .A-Za-z0-9-]%' COLLATE Latin1_General_100_BIN2
+   AND (@PlayerName LIKE N'%[^-_ .A-Za-z0-9]%' COLLATE Latin1_General_100_BIN2
         OR @PlayerName LIKE N'%  %')
 BEGIN
     SELECT [Say What?] = N'Player names here are boring on purpose: up to 30 characters of letters, numbers, single spaces, dots, dashes, and underscores. No emoji, no zero-width shenanigans, no pretending to be somebody else.';
