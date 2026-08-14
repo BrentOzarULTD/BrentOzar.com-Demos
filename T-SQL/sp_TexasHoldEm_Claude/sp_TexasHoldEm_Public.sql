@@ -2143,7 +2143,7 @@ BEGIN
        ThisTurn remains the bounded default; the permanent log itself is
        trimmed to 300 rows, so the opt-in wider views are bounded too. */
     DELETE @Happened;
-    SET @ResponseLogUpper = ISNULL((SELECT MAX(LogId) FROM TexasHoldEm_Public.TexasHoldEm_Log), 0);
+    SET @ResponseLogUpper = @LastLogId;
 
     IF @ShowWhatHappened = N'ThisTurn'
         INSERT @Happened (LogId, Message)
