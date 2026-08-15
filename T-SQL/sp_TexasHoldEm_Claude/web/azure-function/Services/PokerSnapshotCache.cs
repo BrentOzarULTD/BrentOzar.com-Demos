@@ -46,6 +46,10 @@ public sealed class PokerSnapshotCache
             return entry.Snapshot;
         }
 
+        // Before the negative cache, not after: an already-cancelled request used to come out of
+        // WaitAsync as an OperationCanceledException, and it still should. Handing it the stored
+        // SQL failure instead would log an abandoned request as a database outage.
+        cancellationToken.ThrowIfCancellationRequested();
         ThrowIfColdFailureIsCached();
 
         await _refreshLock.WaitAsync(cancellationToken);

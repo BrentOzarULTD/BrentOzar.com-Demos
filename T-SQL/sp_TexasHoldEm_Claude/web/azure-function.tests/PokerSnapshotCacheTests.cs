@@ -102,6 +102,23 @@ public sealed class PokerSnapshotCacheTests
     }
 
     [Fact]
+    public async Task GetAsync_HonorsCancellationRatherThanReplayingTheCachedFailure()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.Zero) { Fail = true };
+        var cache = CreateCache(source, time, 10);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetAsync(CancellationToken.None));
+
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+
+        // An abandoned request is not a database outage, and must not be logged as one.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.GetAsync(cancelled.Token));
+        Assert.Equal(1, source.CallCount);
+    }
+
+    [Fact]
     public async Task GetAsync_ForgetsTheColdFailureAfterASuccessfulRefresh()
     {
         var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
