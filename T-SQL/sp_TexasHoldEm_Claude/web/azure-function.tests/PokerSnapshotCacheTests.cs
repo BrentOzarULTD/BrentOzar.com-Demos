@@ -63,6 +63,83 @@ public sealed class PokerSnapshotCacheTests
     }
 
     [Fact]
+    public async Task GetAsync_CachesAColdFailureSoQueuedRequestsDoNotEachRetrySql()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.FromMilliseconds(25)) { Fail = true };
+        var cache = CreateCache(source, time, 10);
+
+        var failures = await Task.WhenAll(Enumerable.Range(0, 20)
+            .Select(_ => Record.ExceptionAsync(() => cache.GetAsync(CancellationToken.None))));
+
+        Assert.All(failures, failure => Assert.IsType<InvalidOperationException>(failure));
+
+        // The whole point: 20 callers, one SQL attempt. Without the negative cache each caller
+        // takes _refreshLock in turn and pays a full command timeout of its own.
+        Assert.Equal(1, source.CallCount);
+    }
+
+    [Fact]
+    public async Task GetAsync_RetriesOnceTheCachedColdFailureExpires()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.Zero) { Fail = true };
+        var cache = CreateCache(source, time, 10);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetAsync(CancellationToken.None));
+        Assert.Equal(1, source.CallCount);
+
+        time.Advance(TimeSpan.FromSeconds(9));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetAsync(CancellationToken.None));
+        Assert.Equal(1, source.CallCount);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        source.Fail = false;
+        var recovered = await cache.GetAsync(CancellationToken.None);
+
+        Assert.False(recovered.Stale);
+        Assert.Equal(2, source.CallCount);
+    }
+
+    [Fact]
+    public async Task GetAsync_HonorsCancellationRatherThanReplayingTheCachedFailure()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.Zero) { Fail = true };
+        var cache = CreateCache(source, time, 10);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetAsync(CancellationToken.None));
+
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+
+        // An abandoned request is not a database outage, and must not be logged as one.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.GetAsync(cancelled.Token));
+        Assert.Equal(1, source.CallCount);
+    }
+
+    [Fact]
+    public async Task GetAsync_ForgetsTheColdFailureAfterASuccessfulRefresh()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeSource(time, TimeSpan.Zero) { Fail = true };
+        var cache = CreateCache(source, time, 10);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cache.GetAsync(CancellationToken.None));
+
+        time.Advance(TimeSpan.FromSeconds(10));
+        source.Fail = false;
+        await cache.GetAsync(CancellationToken.None);
+
+        // A later failure must now fall back to the stale snapshot, not to the stored exception.
+        time.Advance(TimeSpan.FromSeconds(10));
+        source.Fail = true;
+        var fallback = await cache.GetAsync(CancellationToken.None);
+
+        Assert.True(fallback.Stale);
+    }
+
+    [Fact]
     public async Task GetAsync_DoesNotPassARequestCancellationTokenToTheSharedRefresh()
     {
         var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
