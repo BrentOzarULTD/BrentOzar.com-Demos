@@ -498,7 +498,10 @@
        Rounding to whole minutes turned the 80-second backoff step into "1m",
        which is a shorter wait than the one actually scheduled. */
     function describeDelay(milliseconds) {
-        const seconds = Math.round(
+        /* Ceiling, not rounding: every delay today is a whole number of
+           seconds so the two agree, but rounding is the one that could
+           quietly break the promise this function is making. */
+        const seconds = Math.ceil(
             (milliseconds === undefined ? pollIntervalMilliseconds : milliseconds) / 1000
         );
         if (seconds < 60) {
@@ -634,6 +637,21 @@
                 return !stopped && !paused && myGeneration === generation;
             };
 
+            /* Same question, plus: is the element still on the page? A viewer
+               detached while this request was in flight would otherwise get
+               one more render and one more scheduled poll before the next
+               tick noticed. Tear down here instead of a tick later. */
+            const stillLive = function () {
+                if (!isCurrent()) {
+                    return false;
+                }
+                if (viewer.isConnected === false) {
+                    stop();
+                    return false;
+                }
+                return true;
+            };
+
             /* The host page can swap the viewer out from under us - a
                client-side route change, a block editor re-render - and a
                detached element will never show another snapshot. Polling on
@@ -659,7 +677,7 @@
                    a hide/show pair that already started a newer refresh. A
                    retired refresh must not write to the DOM - the element may
                    be detached, and its response is older than the live one. */
-                if (!isCurrent()) {
+                if (!stillLive()) {
                     return;
                 }
                 if (response.status === 304) {
@@ -684,7 +702,7 @@
                     etag = responseEtag;
                 }
                 const snapshot = await response.json();
-                if (!isCurrent()) {
+                if (!stillLive()) {
                     return;
                 }
                 consecutiveFailures = 0;
@@ -699,7 +717,7 @@
             } catch (error) {
                 /* An abort from retireCurrentWork lands here too, and that's
                    not a dealer that went missing. */
-                if (!isCurrent()) {
+                if (!stillLive()) {
                     return;
                 }
                 consecutiveFailures += 1;
@@ -710,7 +728,7 @@
                 if (activeController === controller) {
                     activeController = null;
                 }
-                if (isCurrent()) {
+                if (stillLive()) {
                     timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
                 }
             }

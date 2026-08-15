@@ -382,6 +382,29 @@ test('a hide/show pair before the first fetch resolves leaves one poll loop', as
     );
 });
 
+test('a viewer detached mid-request tears down without one last poll', async function () {
+    const element = fakeViewer();
+    const pending = [];
+    const win = fakeWindow(function () {
+        return new Promise(function (_resolve, reject) {
+            pending.push(reject);
+        });
+    });
+
+    viewer_boot(element, win);
+    await drain();
+    assert.equal(pending.length, 1, 'the request is in flight');
+
+    // The host page swaps the viewer out while the request is outstanding.
+    element.isConnected = false;
+    pending[0](new Error('landed after detach'));
+    await drain();
+
+    assert.equal(win.timers.size, 0, 'no poll scheduled for a detached element');
+    assert.equal(element.dataset.pokerViewerStarted, undefined, 'torn down now, not a tick later');
+    assert.deepEqual(win.listeners.get('pagehide'), [], 'listeners released');
+});
+
 test('a stopped viewer ignores pagehide and pageshow', async function () {
     const element = fakeViewer();
     const booted = await bootFailingViewer(element);
