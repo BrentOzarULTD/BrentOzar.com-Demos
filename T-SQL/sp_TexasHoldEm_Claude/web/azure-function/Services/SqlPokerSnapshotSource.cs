@@ -49,7 +49,12 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
         command.Parameters.Add("@ShowWhatHappened", SqlDbType.NVarChar, 20).Value = "ThisGame";
         command.Parameters.Add("@WaitForTurn", SqlDbType.Bit).Value = false;
 
-        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+        // Deliberately NOT SequentialAccess. PokerResultSetParser reads columns by name, and
+        // its column check is order-insensitive, so a reordered result set would pass validation
+        // and then fail inside the driver with "Invalid attempt to read from column ordinal N".
+        // These four result sets are one hand row, at most eight seats, and a short log, so
+        // sequential access buys nothing worth that footgun.
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.Default, cancellationToken);
         return await PokerResultSetParser.ParseAsync(reader, _timeProvider.GetUtcNow(), cancellationToken);
     }
 }
