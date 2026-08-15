@@ -273,7 +273,12 @@ CREATE TABLE TexasHoldEm_Public.TexasHoldEm_Players (
     LastPlayedHand int NOT NULL
         CONSTRAINT DF_TexasHoldEm_Players_LastPlayedHand DEFAULT (0),
     LastViewedHand int NOT NULL
-        CONSTRAINT DF_TexasHoldEm_Players_LastViewedHand DEFAULT (0));
+        CONSTRAINT DF_TexasHoldEm_Players_LastViewedHand DEFAULT (0),
+    /* The hand number this seat last won a pot in. The seat grid compares it
+       to the game's current hand number, so it clears itself the moment the
+       next hand is dealt - no cleanup pass required. 0 = never won one. */
+    LastWonHand int NOT NULL
+        CONSTRAINT DF_TexasHoldEm_Players_LastWonHand DEFAULT (0));
 
 /* Upgrade installations created before per-player showdown acknowledgement. */
 IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastPlayedHand') IS NULL
@@ -285,6 +290,12 @@ IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastViewedHand') IS N
     ALTER TABLE TexasHoldEm_Public.TexasHoldEm_Players
         ADD LastViewedHand int NOT NULL
             CONSTRAINT DF_TexasHoldEm_Players_LastViewedHand DEFAULT (0) WITH VALUES;
+
+/* Upgrade installations created before the seat grid called out the winner. */
+IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastWonHand') IS NULL
+    ALTER TABLE TexasHoldEm_Public.TexasHoldEm_Players
+        ADD LastWonHand int NOT NULL
+            CONSTRAINT DF_TexasHoldEm_Players_LastWonHand DEFAULT (0) WITH VALUES;
 
 /* Humans who showed up after all 4 physical seats (and every robot) were
    already spoken for. First in line gets the next chair that opens - see
@@ -577,7 +588,8 @@ DECLARE @PlayerSnapshot TABLE
     InHand bit NOT NULL,
     Folded bit NOT NULL,
     AllIn bit NOT NULL,
-    Cards nvarchar(12) NOT NULL
+    Cards nvarchar(12) NOT NULL,
+    LastWonHand int NOT NULL
 );
 DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS,
     SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32), Chips int);
@@ -1952,7 +1964,8 @@ BEGIN
             SET @WinSeat = NULL;
             SELECT @WinSeat = SeatNum, @WinName = PlayerName
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE InHand = 1 AND Folded = 0;
-            UPDATE TexasHoldEm_Public.TexasHoldEm_Players SET Chips = Chips + @Pot WHERE SeatNum = @WinSeat;
+            UPDATE TexasHoldEm_Public.TexasHoldEm_Players
+               SET Chips = Chips + @Pot, LastWonHand = @GHand WHERE SeatNum = @WinSeat;
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
             VALUES (@GHand, CONCAT(N'Everyone else folded. ', @WinName, N' rakes in ', @Pot, N' chips without showing.'));
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET Pot = 0, TurnSeat = NULL;
@@ -2160,7 +2173,8 @@ BEGIN
                 ;WITH w AS (SELECT sr.SeatNum,
                                    rn = ROW_NUMBER() OVER (ORDER BY CASE WHEN sr.SeatNum > @Dealer THEN 0 ELSE 1 END, sr.SeatNum)
                             FROM @ShowResults sr WHERE sr.Score = @BestScore)
-                UPDATE p SET Chips = p.Chips + @Share + CASE WHEN w.rn <= @Rem THEN 1 ELSE 0 END
+                UPDATE p SET Chips = p.Chips + @Share + CASE WHEN w.rn <= @Rem THEN 1 ELSE 0 END,
+                             LastWonHand = @GHand
                 FROM TexasHoldEm_Public.TexasHoldEm_Players p JOIN w ON w.SeatNum = p.SeatNum;
 
                 IF @NumWinners = 1
@@ -2572,14 +2586,15 @@ BEGIN
        COMMIT, rendering cannot accidentally broaden card visibility. */
     DELETE @PlayerSnapshot;
     INSERT @PlayerSnapshot
-        (SeatNum, PlayerName, IsBot, Chips, BetThisRound, InHand, Folded, AllIn, Cards)
+        (SeatNum, PlayerName, IsBot, Chips, BetThisRound, InHand, Folded, AllIn, Cards, LastWonHand)
     SELECT p.SeatNum, p.PlayerName, p.IsBot, p.Chips, p.BetThisRound,
            p.InHand, p.Folded, p.AllIn,
            CASE WHEN h.HoleCards IS NOT NULL
                      THEN CONCAT(c1.Display, N' ', c2.Display)
                 WHEN p.InHand = 1 AND p.Folded = 0 AND p.HoleCardsEncrypted IS NOT NULL
                      THEN N'[hidden]'
-                ELSE N'' END
+                ELSE N'' END,
+           p.LastWonHand
     FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
     OUTER APPLY
     (
@@ -2781,7 +2796,12 @@ SELECT [Seat] = p.SeatNum,
        [Chips] = p.Chips,
        [This Round] = p.BetThisRound,
        [Cards] = p.Cards,
-       [Status] = CASE WHEN p.Folded = 1 THEN N'Folded'
+       /* Winner! outranks everything else here: the hand is over, so ALL IN
+          and Folded are history, and the whole point of this column at that
+          moment is to answer "who won?" without reading the play-by-play.
+          The flag ages out on its own - the next deal bumps the hand number. */
+       [Status] = CASE WHEN p.LastWonHand > 0 AND p.LastWonHand = @GHand THEN N'Winner!'
+                       WHEN p.Folded = 1 THEN N'Folded'
                        WHEN p.AllIn = 1 THEN N'ALL IN'
                        WHEN @GState = 'InHand' AND p.SeatNum = @TurnSeat THEN N'<<< deciding'
                        WHEN @GState = 'InHand' AND p.InHand = 0 THEN N'Sitting out this hand'
