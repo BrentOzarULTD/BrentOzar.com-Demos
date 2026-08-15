@@ -22,6 +22,10 @@
     'use strict';
 
     const pollIntervalMilliseconds = 10000;
+    /* A dealer that's been missing for two minutes is not coming back in ten
+       seconds. Back off rather than hammering a known-dead endpoint for as
+       long as somebody leaves the tab open. */
+    const maxPollIntervalMilliseconds = 120000;
     const requestTimeoutMilliseconds = 25000;
     const canvasWidth = 1340;
     const canvasHeight = 820;
@@ -478,52 +482,187 @@
         return scale;
     }
 
-    function statusText(game, stale) {
-        const hand = game.handNumber === null ? 'Waiting' : 'Hand ' + game.handNumber;
-        if (stale) {
-            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · retrying in 10s';
+    /* Doubling, capped. Zero failures means the happy path, so the very first
+       retry after a failure is still the ordinary ten seconds. */
+    function backoffDelay(consecutiveFailures) {
+        if (!(consecutiveFailures > 0)) {
+            return pollIntervalMilliseconds;
         }
-        return hand + ' · ' + game.street + ' · refresh in 10s';
+        return Math.min(
+            pollIntervalMilliseconds * Math.pow(2, consecutiveFailures - 1),
+            maxPollIntervalMilliseconds
+        );
     }
 
-    function updateStatus(viewer, game, state) {
+    /* Exact, because the pill is a promise about when the table refreshes.
+       Rounding to whole minutes turned the 80-second backoff step into "1m",
+       which is a shorter wait than the one actually scheduled. */
+    function describeDelay(milliseconds) {
+        /* Ceiling, not rounding: every delay today is a whole number of
+           seconds so the two agree, but rounding is the one that could
+           quietly break the promise this function is making. */
+        const seconds = Math.ceil(
+            (milliseconds === undefined ? pollIntervalMilliseconds : milliseconds) / 1000
+        );
+        if (seconds < 60) {
+            return seconds + 's';
+        }
+
+        const minutes = Math.floor(seconds / 60);
+        const remainder = seconds % 60;
+        return remainder === 0 ? minutes + 'm' : minutes + 'm ' + remainder + 's';
+    }
+
+    function statusText(game, stale, delayMilliseconds) {
+        const delay = describeDelay(delayMilliseconds);
+        const hand = game.handNumber === null ? 'Waiting' : 'Hand ' + game.handNumber;
+        if (stale) {
+            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · retrying in ' + delay;
+        }
+        return hand + ' · ' + game.street + ' · refresh in ' + delay;
+    }
+
+    function updateStatus(viewer, game, state, delayMilliseconds) {
         const status = viewer.querySelector('[data-role="status"]');
         const dot = viewer.querySelector('[data-role="status-dot"]');
 
         if (state === 'error') {
-            status.textContent = 'Dealer went missing · retrying in 10s';
+            status.textContent = 'Dealer went missing · retrying in ' + describeDelay(delayMilliseconds);
             dot.dataset.state = 'error';
             return;
         }
 
         const stale = state === 'stale';
-        status.textContent = statusText(game, stale);
+        status.textContent = statusText(game, stale, delayMilliseconds);
         dot.dataset.state = stale ? 'stale' : 'live';
     }
 
     function start(viewer, windowObject) {
         if (viewer.dataset.pokerViewerStarted === 'true') {
-            return;
+            return null;
         }
         viewer.dataset.pokerViewerStarted = 'true';
 
         const endpoint = viewer.dataset.endpoint;
         let lastGame = null;
         let etag = null;
+        let consecutiveFailures = 0;
+        let timerId = null;
+        let observer = null;
+        let stopped = false;
+        let paused = false;
+        /* Bumped whenever the loop is torn down or suspended. A refresh
+           captures it on entry and stands down if it no longer matches, so a
+           request that was already in flight when the page was hidden can't
+           render or reschedule after a resume has started a newer one. */
+        let generation = 0;
+        let activeController = null;
 
         const fitTable = function () {
             fit(viewer);
         };
         if (typeof windowObject.ResizeObserver === 'function') {
-            const observer = new windowObject.ResizeObserver(fitTable);
+            observer = new windowObject.ResizeObserver(fitTable);
             observer.observe(viewer.querySelector('[data-role="scaler"]'));
         } else {
             windowObject.addEventListener('resize', fitTable);
         }
         fitTable();
 
+        /* Retires whatever is in flight: cancels the pending poll, aborts an
+           open request, and invalidates any refresh already past its await. */
+        function retireCurrentWork() {
+            generation += 1;
+            if (timerId !== null) {
+                windowObject.clearTimeout(timerId);
+                timerId = null;
+            }
+            if (activeController !== null) {
+                activeController.abort();
+                activeController = null;
+            }
+        }
+
+        /* Idempotent: an explicit caller and the detached-element check below
+           can both land on it. Permanent - use pause/resume for a page that
+           might come back. */
+        function stop() {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            retireCurrentWork();
+            if (observer !== null) {
+                observer.disconnect();
+            } else {
+                windowObject.removeEventListener('resize', fitTable);
+            }
+            windowObject.removeEventListener('pagehide', handlePageHide);
+            windowObject.removeEventListener('pageshow', handlePageShow);
+            delete viewer.dataset.pokerViewerStarted;
+        }
+
+        /* Navigating away isn't the same as being finished: the back/forward
+           cache can restore this exact page, listeners and closures intact.
+           Stopping outright would leave the visitor staring at a table frozen
+           at whatever it showed when they left, so pause instead. */
+        function handlePageHide() {
+            if (stopped || paused) {
+                return;
+            }
+            paused = true;
+            retireCurrentWork();
+        }
+
+        function handlePageShow() {
+            if (stopped || !paused) {
+                return;
+            }
+            paused = false;
+            retireCurrentWork();
+            refresh();
+        }
+
         async function refresh() {
+            timerId = null;
+            if (stopped || paused) {
+                return;
+            }
+
+            /* This refresh's claim on the loop. Checked after every await:
+               state alone isn't enough, because a hide/show pair leaves
+               paused false again while this request is still outstanding. */
+            const myGeneration = generation;
+            const isCurrent = function () {
+                return !stopped && !paused && myGeneration === generation;
+            };
+
+            /* Same question, plus: is the element still on the page? A viewer
+               detached while this request was in flight would otherwise get
+               one more render and one more scheduled poll before the next
+               tick noticed. Tear down here instead of a tick later. */
+            const stillLive = function () {
+                if (!isCurrent()) {
+                    return false;
+                }
+                if (viewer.isConnected === false) {
+                    stop();
+                    return false;
+                }
+                return true;
+            };
+
+            /* The host page can swap the viewer out from under us - a
+               client-side route change, a block editor re-render - and a
+               detached element will never show another snapshot. Polling on
+               its behalf just keeps it, and this closure, alive. */
+            if (viewer.isConnected === false) {
+                stop();
+                return;
+            }
+
             const controller = new windowObject.AbortController();
+            activeController = controller;
             const timeout = windowObject.setTimeout(function () {
                 controller.abort();
             }, requestTimeoutMilliseconds);
@@ -534,12 +673,24 @@
                     headers: requestHeaders(etag),
                     signal: controller.signal
                 });
+                /* Everything past the await can land after a stop(), or after
+                   a hide/show pair that already started a newer refresh. A
+                   retired refresh must not write to the DOM - the element may
+                   be detached, and its response is older than the live one. */
+                if (!stillLive()) {
+                    return;
+                }
                 if (response.status === 304) {
-                    if (lastGame) {
-                        updateStatus(viewer, lastGame, lastGame.stale ? 'stale' : 'live');
-                    } else {
+                    if (!lastGame) {
                         throw new Error('API returned HTTP 304 before the first snapshot.');
                     }
+                    consecutiveFailures = 0;
+                    updateStatus(
+                        viewer,
+                        lastGame,
+                        lastGame.stale ? 'stale' : 'live',
+                        pollIntervalMilliseconds
+                    );
                     return;
                 }
                 if (!response.ok) {
@@ -551,29 +702,59 @@
                     etag = responseEtag;
                 }
                 const snapshot = await response.json();
+                if (!stillLive()) {
+                    return;
+                }
+                consecutiveFailures = 0;
                 lastGame = render(viewer, snapshot);
-                updateStatus(viewer, lastGame, snapshot.stale === true ? 'stale' : 'live');
+                updateStatus(
+                    viewer,
+                    lastGame,
+                    snapshot.stale === true ? 'stale' : 'live',
+                    pollIntervalMilliseconds
+                );
                 fitTable();
             } catch (error) {
-                updateStatus(viewer, lastGame, 'error');
+                /* An abort from retireCurrentWork lands here too, and that's
+                   not a dealer that went missing. */
+                if (!stillLive()) {
+                    return;
+                }
+                consecutiveFailures += 1;
+                updateStatus(viewer, lastGame, 'error', backoffDelay(consecutiveFailures));
                 windowObject.console.error('Texas Hold Em viewer refresh failed.', error);
             } finally {
                 windowObject.clearTimeout(timeout);
-                windowObject.setTimeout(refresh, pollIntervalMilliseconds);
+                if (activeController === controller) {
+                    activeController = null;
+                }
+                if (stillLive()) {
+                    timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
+                }
             }
         }
 
+        windowObject.addEventListener('pagehide', handlePageHide);
+        windowObject.addEventListener('pageshow', handlePageShow);
         refresh();
+        return stop;
     }
 
     function boot(documentObject, windowObject) {
+        const stops = [];
         documentObject.querySelectorAll('[data-texas-holdem-viewer]').forEach(function (viewer) {
-            start(viewer, windowObject);
+            const stop = start(viewer, windowObject);
+            if (stop) {
+                stops.push(stop);
+            }
         });
+        return stops;
     }
 
     return {
+        backoffDelay: backoffDelay,
         boot: boot,
+        describeDelay: describeDelay,
         fit: fit,
         formatMoney: formatMoney,
         normalizeSnapshot: normalizeSnapshot,
