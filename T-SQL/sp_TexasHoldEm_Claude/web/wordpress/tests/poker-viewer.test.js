@@ -22,6 +22,25 @@ test('parseCards understands design codes and turns hidden text into card backs'
     assert.deepEqual(viewer.parseCards('[hidden]', 2), [null, null]);
 });
 
+test('parseCards ignores the procedure placeholders that are prose, not cards', function () {
+    // '(nothing dealt yet)' hides a 't' followed by an 'h' inside 'nothing',
+    // which an unanchored scan reads as the ten of hearts.
+    assert.deepEqual(viewer.parseCards('(nothing dealt yet)', 5), [null, null, null, null, null]);
+    assert.deepEqual(viewer.parseCards('(none yet)', 2), [null, null]);
+    assert.deepEqual(viewer.parseCards('(observer)', 2), [null, null]);
+    assert.deepEqual(viewer.parseCards('', 2), [null, null]);
+});
+
+test('parseCards still reads a partly dealt board', function () {
+    assert.deepEqual(viewer.parseCards('A♠ K♥ Q♦', 5), [
+        { rank: 'A', suit: '♠', red: false },
+        { rank: 'K', suit: '♥', red: true },
+        { rank: 'Q', suit: '♦', red: true },
+        null,
+        null
+    ]);
+});
+
 test('requestHeaders adds the last server ETag only after one is available', function () {
     assert.deepEqual(viewer.requestHeaders(null), { Accept: 'application/json' });
     assert.deepEqual(viewer.requestHeaders('"snapshot-47"'), {

@@ -97,7 +97,12 @@
         if (Array.isArray(value)) {
             candidates = value;
         } else if (typeof value === 'string') {
-            candidates = value.match(/(?:10|[2-9tjqka])(?:[shdc♠♥♦♣])/gi) || [];
+            /* Whitespace-delimited on purpose. The procedure sends prose when
+               it has no cards to show - '(nothing dealt yet)' for an undealt
+               board - and an unanchored scan finds the 't' + 'h' inside
+               'nothing' and deals a phantom ten of hearts. parseCard trims,
+               so the captured leading space doesn't matter. */
+            candidates = value.match(/(?:^|\s)(?:10|[2-9tjqka])[shdc♠♥♦♣](?=\s|$)/gi) || [];
         }
 
         const cards = candidates.map(parseCard).filter(function (card) {
