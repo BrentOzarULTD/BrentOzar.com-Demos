@@ -177,10 +177,12 @@ function drain() {
 function fakeWindow(fetchImpl) {
     let nextTimerId = 1;
     const timers = new Map();
+    const intervals = new Map();
     const listeners = new Map();
 
     return {
         timers: timers,
+        intervals: intervals,
         listeners: listeners,
         fetch: fetchImpl,
         console: { error: function () {} },
@@ -195,6 +197,14 @@ function fakeWindow(fetchImpl) {
         },
         clearTimeout: function (id) {
             timers.delete(id);
+        },
+        setInterval: function (fn, delay) {
+            const id = nextTimerId += 1;
+            intervals.set(id, { fn: fn, delay: delay });
+            return id;
+        },
+        clearInterval: function (id) {
+            intervals.delete(id);
         },
         addEventListener: function (type, fn) {
             if (!listeners.has(type)) {
@@ -247,6 +257,16 @@ function viewer_boot(element, win) {
     return viewer.boot(fakeDocument(element), win);
 }
 
+// Runs the countdown ticker the given number of whole seconds.
+function tickCountdown(win, seconds) {
+    const entries = Array.from(win.intervals.values());
+    assert.equal(entries.length, 1, 'exactly one countdown ticker should be running');
+    assert.equal(entries[0].delay, 1000, 'the ticker should run once a second');
+    for (let i = 0; i < seconds; i += 1) {
+        entries[0].fn();
+    }
+}
+
 // Fires the single pending poll timer and returns the delay it waited.
 async function fireNextPoll(win) {
     const entries = Array.from(win.timers.entries());
@@ -290,6 +310,48 @@ test('stopping the viewer cancels the pending poll and stays stopped', async fun
 
     booted.stop();
     assert.equal(booted.win.timers.size, 0, 'stopping twice should be harmless');
+    assert.equal(booted.win.intervals.size, 0, 'the countdown ticker should be cleared too');
+});
+
+test('the pill counts the wait down instead of freezing on the scheduled delay', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+    const pill = element.nodes['[data-role="status"]'];
+
+    assert.equal(pill.textContent, 'Dealer went missing · retrying in 10s');
+
+    tickCountdown(booted.win, 1);
+    assert.equal(pill.textContent, 'Dealer went missing · retrying in 9s');
+
+    tickCountdown(booted.win, 8);
+    assert.equal(pill.textContent, 'Dealer went missing · retrying in 1s');
+
+    /* The wait is over: the request is out, so stop promising a countdown
+       and never report a negative one. */
+    tickCountdown(booted.win, 3);
+    assert.equal(pill.textContent, 'Dealer went missing · retrying now');
+
+    /* And the next scheduled poll resets it to the real backoff delay. */
+    assert.equal(await fireNextPoll(booted.win), 10000);
+    assert.equal(pill.textContent, 'Dealer went missing · retrying in 20s');
+
+    booted.stop();
+});
+
+test('a paused viewer stops ticking its countdown', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+    const pill = element.nodes['[data-role="status"]'];
+
+    fire(booted.win, 'pagehide');
+    tickCountdown(booted.win, 5);
+    assert.equal(
+        pill.textContent,
+        'Dealer went missing · retrying in 10s',
+        'a backgrounded page should not count down a poll that was retired'
+    );
+
+    booted.stop();
 });
 
 test('a viewer detached from the document stops polling on its own', async function () {
