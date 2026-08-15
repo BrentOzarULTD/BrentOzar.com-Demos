@@ -2305,16 +2305,8 @@ BEGIN
               ON p.PlayerName = i.PlayerName
             WHERE p.IsBot = 0;
 
-            /* Both kinds of bust get announced, but they aren't the same
-               event and can't share wording. Humans have an identity row and
-               a retention window; robots have neither, so telling the table
-               that Clippy "cannot rebuy during retention" is false - and
-               reads especially badly one line above the refill message. Filtering the robots
-               out of the human wording is only half the fix: drop them
-               entirely and an ordinary one-robot bust produces no message at
-               all, and the next hand's "Filling the empty seats with robots"
-               lists everyone seated rather than who's new, so it never
-               backfills the fact either. */
+            /* Announce both kinds of bust without pretending robots have a
+               retained identity or promising who will take the empty seat. */
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
             SELECT @GHand, CONCAT(PlayerName,
                    CASE WHEN IsBot = 1
