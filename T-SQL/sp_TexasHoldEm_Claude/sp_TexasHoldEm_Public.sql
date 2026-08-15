@@ -535,7 +535,7 @@ DECLARE @rc int,
         @SeatExists bit, @CurOwner int, @CurLoginTime datetime2,
         @SeatSalt varbinary(16), @SeatHash varbinary(32),
         @FoundBySession bit = 0, @WaitId int, @WaitPos int, @MyReservedSeat tinyint,
-        @MyNeedsToAct bit, @MyFolded bit,
+        @MyNeedsToAct bit, @MyFolded bit, @MissedAction nvarchar(20),
         @MyChips int, @MyBet int, @MyC1 tinyint, @MyC2 tinyint, @MyCards nvarchar(12),
         /* engine workspace */
         @Spins int, @StartHandNow bit, @HandDone bit,
@@ -1541,7 +1541,14 @@ BEGIN
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE SeatNum = @MySeat;
 
             IF @GState <> 'InHand' OR @TurnSeat <> @MySeat OR ISNULL(@MyNeedsToAct, 0) = 0 OR @MyFolded = 1
+            BEGIN
                 SET @Notice = N'It''s not your turn right now (maybe the shot clock got you?). Hang tight.';
+                /* Remember WHICH action bounced. This session doesn't return
+                   yet - it keeps waiting - and the table can hand the turn
+                   back before it does, at which point this notice is a lie.
+                   See the rewrite just past the wait loop. */
+                SET @MissedAction = @Action;
+            END
             ELSE
             BEGIN
                 SET @Owed = @BetToCall - @MyBet;
@@ -2747,6 +2754,20 @@ BEGIN
 
     WAITFOR DELAY '00:00:02';
 END /* main wait loop */
+
+/* A rejected action ages badly. "It's not your turn" was true when the
+   action arrived, but this session then sat in the loop above until it had
+   something to say - and the most common reason it stops waiting is that the
+   turn came back around. Delivering the original wording now would argue
+   with the YOUR TURN prompt three inches above it in the same response, which
+   is exactly what a player reports as a bug. Same fact, told against the
+   table as it stands at the moment they read it. */
+IF @MissedAction IS NOT NULL AND @LastNotice IS NOT NULL
+   AND @GState = 'InHand' AND @SeatExists = 1 AND @TurnSeat = @MySeat
+   AND @MyNeedsToAct = 1 AND @MyFolded = 0
+    SET @LastNotice = CONCAT(N'Your ', @MissedAction,
+        N' didn''t count - the table had already moved past that decision when it arrived. ',
+        N'You''re up NOW though, so run one of the commands in What Now.');
 
 /* ================================================================
    Show this session everything: the table, the players, exactly what to
