@@ -58,13 +58,30 @@ if ! az functionapp show \
         --output none
 fi
 
+# The connection string must not reach az's argv: for the life of the call,
+# anything in the process table is readable by every other user on the box.
+# --settings @file keeps it out. JSON only requires backslashes and double
+# quotes to be escaped here - a connection string carries no control
+# characters - so this needs no JSON tooling the deploy box might not have.
+settings_file="$(mktemp "${TMPDIR:-/tmp}/poker-appsettings.XXXXXX")"
+trap 'rm -f "${settings_file}"' EXIT
+chmod 600 "${settings_file}"
+
+escaped_connection_string="${POKER_SQL_CONNECTION_STRING//\\/\\\\}"
+escaped_connection_string="${escaped_connection_string//\"/\\\"}"
+
+cat > "${settings_file}" <<JSON
+[
+  { "name": "PokerSqlConnectionString", "value": "${escaped_connection_string}", "slotSetting": false },
+  { "name": "PokerCacheSeconds", "value": "10", "slotSetting": false },
+  { "name": "PokerCommandTimeoutSeconds", "value": "20", "slotSetting": false }
+]
+JSON
+
 az functionapp config appsettings set \
     --name "${AZURE_FUNCTION_APP}" \
     --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --settings \
-        "PokerSqlConnectionString=${POKER_SQL_CONNECTION_STRING}" \
-        "PokerCacheSeconds=10" \
-        "PokerCommandTimeoutSeconds=20" \
+    --settings "@${settings_file}" \
     --output none
 
 if ! az functionapp cors show \
