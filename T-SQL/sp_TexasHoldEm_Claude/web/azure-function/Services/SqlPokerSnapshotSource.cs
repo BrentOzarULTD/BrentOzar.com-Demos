@@ -7,6 +7,8 @@ namespace PokerApi.Services;
 
 public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
 {
+    private static readonly string[] ShowWhatHappenedOptions = ["ThisTurn", "ThisGame", "AllHistory"];
+
     private readonly string _connectionString;
     private readonly int _commandTimeoutSeconds;
     private readonly TimeProvider _timeProvider;
@@ -29,7 +31,21 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
         {
             throw new InvalidOperationException("PokerCommandTimeoutSeconds must be between 1 and 120.");
         }
+
+        // The viewer renders neither WhatNow nor History, so the default asks the procedure for
+        // the least it will give us. ThisGame pulls every log row since the game started, which
+        // on a long table is hundreds of strings that every polling browser downloads every ten
+        // seconds and throws away. Set PokerShowWhatHappened=ThisGame to put the play-by-play
+        // back in the payload for a viewer that wants to render it.
+        ShowWhatHappened = configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? "ThisTurn";
+        if (!ShowWhatHappenedOptions.Contains(ShowWhatHappened, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"PokerShowWhatHappened must be one of {string.Join(", ", ShowWhatHappenedOptions)}.");
+        }
     }
+
+    internal string ShowWhatHappened { get; }
 
     public async Task<PokerSnapshot> LoadAsync(CancellationToken cancellationToken)
     {
@@ -46,7 +62,7 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
                 @WaitForTurn = @WaitForTurn;
             """;
         command.Parameters.Add("@Action", SqlDbType.NVarChar, 20).Value = "Status";
-        command.Parameters.Add("@ShowWhatHappened", SqlDbType.NVarChar, 20).Value = "ThisGame";
+        command.Parameters.Add("@ShowWhatHappened", SqlDbType.NVarChar, 20).Value = ShowWhatHappened;
         command.Parameters.Add("@WaitForTurn", SqlDbType.Bit).Value = false;
 
         // Deliberately NOT SequentialAccess. PokerResultSetParser reads columns by name, and
