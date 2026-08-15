@@ -718,7 +718,7 @@ BEGIN
         (16,N'Results come back as: Hand, Seat, What Now, What Happened.'),
         (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
         (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for all retained rows since RESET or explicit NEWGAME.'),
-        (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- start fresh after GAME OVER'),
+        (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- discard retained identities and start completely fresh after GAME OVER'),
         (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table'),
         (21,N'Busted identities stay OUT for 60 minutes; they cannot immediately collect another free stack.'),
         (22,N'Timed-out players keep their chips off-table for 10 minutes and may reconnect to request a seat.')
@@ -926,13 +926,26 @@ BEGIN
             FROM TexasHoldEm_Public.TexasHoldEm_Game;
         END
 
-        /* Last game ended? Joining sweeps up the confetti and starts fresh. */
+        /* Last game ended? A plain join opens the next lobby without breaking
+           the retention promises made to off-table humans. Explicit NEWGAME
+           and RESET above remain the deliberate, destructive fresh-roster
+           controls. PLAYER identities cannot survive without their cleared
+           seat rows; SPECTATOR bankrolls and OUT lockouts keep their original
+           LastSeenAt so the ordinary expiry sweep below still owns the clock. */
         IF (SELECT GameState FROM TexasHoldEm_Public.TexasHoldEm_Game) = 'GameOver' AND @Action IS NULL
         BEGIN
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
             DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
-            DELETE TexasHoldEm_Public.TexasHoldEm_Identities;
+            DELETE TexasHoldEm_Public.TexasHoldEm_Identities
+             WHERE PlayerRole = 'PLAYER';
+            /* Hand numbers restart at one, so old participation markers must
+               not make a retained identity look involved in the new game's
+               identically numbered hands. Waitlist intent also ended with the
+               old game; the bankroll or lockout itself did not. */
+            UPDATE TexasHoldEm_Public.TexasHoldEm_Identities
+               SET WantsSeat = 0, LastPlayedHand = 0, LastViewedHand = 0
+             WHERE PlayerRole IN ('SPECTATOR', 'OUT');
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game
                SET GameState = 'WaitingForPlayers', HandNumber = 0, DealerSeat = NULL,
                    SmallBlindSeat = NULL, BigBlindSeat = NULL, BettingRound = NULL,
@@ -1066,7 +1079,7 @@ BEGIN
                AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
             BEGIN
                 SET @Notice = CONCAT(N'You are OUT with 0 chips. That identity stays busted for ',
-                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the roster.');
+                    @OutRetentionMinutes, N' minutes; RESET or explicit NEWGAME clears the roster.');
                 SET @ReturnNow = 1;
             END
         END
@@ -2971,7 +2984,8 @@ ELSE IF @LeftTable = 1
         (N'You''ve left the game. Thanks for playing! Run EXEC sp_TexasHoldEm_Public any time to get back in.');
 ELSE IF @GState = 'GameOver'
     INSERT @Prompt (Line) VALUES
-        (N'GAME OVER. Run EXEC sp_TexasHoldEm_Public @Action = ''NewGame'' to open a fresh game.'),
+        (N'GAME OVER. Run EXEC sp_TexasHoldEm_Public to open the next lobby while honoring retained bankrolls and OUT lockouts.'),
+        (N'Use @Action = ''NewGame'' only to discard retained identities and open a completely fresh roster.'),
         (N'A database administrator can use @Action = ''Reset'' to abandon a stuck game at any time.');
 ELSE IF @GState = 'InHand' AND @SeatExists = 1 AND @TurnSeat = @MySeat
      AND @MyNeedsToAct = 1 AND @MyFolded = 0

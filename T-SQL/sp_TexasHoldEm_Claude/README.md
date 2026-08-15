@@ -70,16 +70,17 @@ The four result sets keep the same order and shape in both modes.
 | `Leave` | Cash out (folds first if you're mid-hand) |
 | `Watch` | Spectate without taking a seat |
 | `Status` | Instant snapshot of the table — never blocks |
-| `NewGame` | Open a fresh lobby after `GAME OVER` |
+| `NewGame` | Discard retained identities and open a completely fresh lobby after `GAME OVER` |
 | `Reset` | Atomically abandon any table and open a fresh lobby (database administrators only) |
 | `Help` | Cheat sheet |
 
-Actions are case-insensitive. A normal join after `GAME OVER` still starts a
-new game for backward compatibility; `NewGame` makes that lifecycle choice
-explicit. Both lifecycle commands clear seats, waitlist reservations, retained
-identities, cards, bets, pot, and prior game log state under the game lock,
-then record the initiating database identity in the new log without including
-credentials.
+Actions are case-insensitive. A normal join after `GAME OVER` starts the next
+lobby for backward compatibility while preserving unexpired `SPECTATOR`
+bankrolls and `OUT` lockouts. Explicit `NewGame` makes the destructive
+fresh-roster choice: like administrator `Reset`, it clears seats, waitlist
+reservations, retained identities, cards, bets, pot, and prior game log state
+under the game lock, then records the initiating database identity in the new
+log without including credentials.
 
 ## House rules
 
@@ -87,7 +88,9 @@ credentials.
   turn and river, max one bet + three raises per betting round.
 - A genuinely new identity starts with 1,000 chips. When that identity busts,
   it stays `OUT` for 60 minutes and cannot immediately collect another free
-  stack. A new game or administrator `Reset` starts a fresh roster.
+  stack. An automatic post-`GAME OVER` lobby preserves that lockout and any
+  unexpired spectator bankroll; explicit `NewGame` or administrator `Reset`
+  starts a fresh roster.
 - Bust every robot at the table and you keep your stack — that isn't a win
   condition, it's just a big pot. On the next hand, queued humans take open
   seats first, then fresh robots buy in for 1,000 each wherever chairs remain.
