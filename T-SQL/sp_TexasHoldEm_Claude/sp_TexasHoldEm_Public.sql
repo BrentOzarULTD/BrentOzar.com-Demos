@@ -2381,16 +2381,11 @@ BEGIN
                 VALUES (@GHand, N'No humans remain. The machines win. GAME OVER.');
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @NumPlayers = 1 AND @ReturningHumans = 0
-                    AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
-            BEGIN
-                INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-                SELECT @GHand, CONCAT(N'*** ', PlayerName, N' WINS IT ALL with ', Chips, N' chips! GAME OVER. ***')
-                FROM TexasHoldEm_Public.TexasHoldEm_Players;
-                UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
-            END
             ELSE
             BEGIN
+                /* A lone surviving human keeps playing with the stack they
+                   won. The next-hand setup fills the empty seats with fresh
+                   robots, so this is between hands rather than game over. */
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, CONCAT(N'Waiting for participating humans to receive the result; the next hand starts after everyone checks in or ',
                         @BetweenHandsSeconds, N' seconds pass.'));
