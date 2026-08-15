@@ -37,9 +37,15 @@ Do not continue until that query returns one row. The Function calls:
 ```sql
 EXEC dbo.sp_TexasHoldEm_Public
     @Action = N'Status',
-    @ShowWhatHappened = N'ThisGame',
+    @ShowWhatHappened = N'ThisTurn',
     @WaitForTurn = 0;
 ```
+
+`@ShowWhatHappened` comes from the optional `PokerShowWhatHappened` application
+setting and defaults to `ThisTurn`, because the viewer renders neither the
+`whatNow` nor the `history` array. Set it to `ThisGame` (or `AllHistory`) if you
+build a viewer that shows the play-by-play; it makes the JSON considerably
+larger, and every polling browser pays for it every ten seconds.
 
 The public SQL login needs only the permission granted by the installer. The
 Function deliberately sends no player name or seat password, so its cached
