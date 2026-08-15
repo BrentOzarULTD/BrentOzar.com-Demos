@@ -58,13 +58,39 @@ if ! az functionapp show \
         --output none
 fi
 
+# The connection string must not reach az's argv: for the life of the call,
+# anything in the process table is readable by every other user on the box.
+# --settings @file keeps it out.
+#
+# Escaping backslashes and double quotes is then enough to build the JSON by
+# hand, with no dependency on a JSON tool the deploy box might not have - but
+# only because a connection string has no control characters in it. Check that
+# rather than assume it: a stray newline would otherwise produce invalid JSON
+# and an az parse error that says nothing about where it came from.
+if [[ "${POKER_SQL_CONNECTION_STRING}" == *[$'\x01'-$'\x1f']* ]]; then
+    echo "POKER_SQL_CONNECTION_STRING contains a control character (newline or tab?). Remove it and rerun." >&2
+    exit 1
+fi
+
+settings_file="$(mktemp "${TMPDIR:-/tmp}/poker-appsettings.XXXXXX")"
+trap 'rm -f "${settings_file}"' EXIT
+chmod 600 "${settings_file}"
+
+escaped_connection_string="${POKER_SQL_CONNECTION_STRING//\\/\\\\}"
+escaped_connection_string="${escaped_connection_string//\"/\\\"}"
+
+cat > "${settings_file}" <<JSON
+[
+  { "name": "PokerSqlConnectionString", "value": "${escaped_connection_string}", "slotSetting": false },
+  { "name": "PokerCacheSeconds", "value": "10", "slotSetting": false },
+  { "name": "PokerCommandTimeoutSeconds", "value": "20", "slotSetting": false }
+]
+JSON
+
 az functionapp config appsettings set \
     --name "${AZURE_FUNCTION_APP}" \
     --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --settings \
-        "PokerSqlConnectionString=${POKER_SQL_CONNECTION_STRING}" \
-        "PokerCacheSeconds=10" \
-        "PokerCommandTimeoutSeconds=20" \
+    --settings "@${settings_file}" \
     --output none
 
 if ! az functionapp cors show \
