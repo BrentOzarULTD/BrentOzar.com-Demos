@@ -57,7 +57,8 @@ What hostile players CAN'T do here (all of which work on the original):
 What they still CAN do, because a stored procedure is not a bouncer:
   - Occupy seats and play terribly. Working as intended.
   - Stall. The shot clock auto-folds them; three strikes and the seat opens.
-  - Walk away mid-game. An abandoned table gets swept after 30 minutes.
+  - Walk away mid-game. An abandoned table gets cleared after 30 minutes;
+    seated humans can reclaim their banked stacks for the next 10 minutes.
   - Open piles of connections and burn worker threads. That's a resource
     governance problem, not a poker problem: host this in a small, cheap
     database that shares hardware with nothing you love. Waiting queries
@@ -120,8 +121,9 @@ HOW TO PLAY
                        NEWGAME. Bring popcorn.
 
 Actions: Join (default), Check, Call, Bet, Raise, AllIn, Fold, Leave, Watch,
-         Status (instant snapshot, never blocks), NewGame (after GAME OVER),
-         Reset (database administrators only), Help. Actions are case-insensitive.
+         Status (instant snapshot, never blocks), NewGame (database administrators
+         only, after GAME OVER), Reset (database administrators only), Help.
+         Actions are case-insensitive.
 
 House rules:
   - Fixed-limit Hold 'Em: blinds 10/20, bets 20 pre-flop & flop, 40 on the
@@ -588,8 +590,7 @@ DECLARE @IdentityFound bit = 0,
         @IdentityName nvarchar(30),
         @IdentityId bigint,
         @IdentitySession int,
-        @IdentityLoginTime datetime2,
-        @IdentitiesToEvict int;
+        @IdentityLoginTime datetime2;
 
 DECLARE @NewLog TABLE (LogId int, Message nvarchar(500));
 DECLARE @Shuffled TABLE (Pos int, CardId tinyint);
@@ -718,7 +719,7 @@ BEGIN
         (16,N'Results come back as: Hand, Seat, What Now, What Happened.'),
         (17,N'What Happened shows just this turn by default. Add @ShowWhatHappened = ''ThisGame'''),
         (18,N'for the whole game, or @ShowWhatHappened = ''AllHistory'' for all retained rows since RESET or explicit NEWGAME.'),
-        (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- discard retained identities and start completely fresh after GAME OVER'),
+        (19,N'EXEC sp_TexasHoldEm_Public @Action = ''NewGame'';  -- administrators only: discard retained identities after GAME OVER'),
         (20,N'EXEC sp_TexasHoldEm_Public @Action = ''Reset'';    -- database administrators only; abandon any table'),
         (21,N'Busted identities stay OUT for 60 minutes; they cannot immediately collect another free stack.'),
         (22,N'Timed-out players keep their chips off-table for 10 minutes and may reconnect to request a seat.')
@@ -727,9 +728,9 @@ BEGIN
     RETURN;
 END
 
-IF @Action = N'Reset'
+IF @Action IN (N'Reset', N'NewGame')
    AND ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL'), 0) <> 1
-    THROW 50006, 'RESET is restricted to database administrators.', 1;
+    THROW 50006, 'RESET and NEWGAME are restricted to database administrators.', 1;
 
 /* Names for the public: short and boring, on purpose. No quotes to escape,
    no control characters to forge log lines with, no Unicode homoglyphs to
@@ -915,6 +916,21 @@ BEGIN
            AND ISNULL((SELECT MAX(EventTime) FROM TexasHoldEm_Public.TexasHoldEm_Log), SYSDATETIME())
                < DATEADD(minute, -@AbandonedAfterMinutes, SYSDATETIME())
         BEGIN
+            /* The table is abandoned, not the bankroll. Bank each seated
+               human's remaining stack under the same 10-minute SPECTATOR
+               retention used by a shot-clock removal. Starting the clock now
+               matters: their prior LastSeenAt is necessarily older than the
+               abandonment threshold and would expire on this same call. */
+            UPDATE i
+               SET Chips = p.Chips, PlayerRole = 'SPECTATOR', WantsSeat = 0,
+                   TimedOut = 1, LastSeenAt = SYSDATETIME(),
+                   LastPlayedHand = p.LastPlayedHand,
+                   LastViewedHand = p.LastViewedHand
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+            JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+              ON p.PlayerName = i.PlayerName
+            WHERE p.IsBot = 0 AND p.Chips > 0;
+
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
             DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
@@ -922,7 +938,8 @@ BEGIN
                SET GameState = 'GameOver', TurnSeat = NULL, NextHandStartsAt = NULL;
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
             SELECT HandNumber, CONCAT(N'The table sat abandoned for ', @AbandonedAfterMinutes,
-                   N' minutes, so the house swept the chips and reset the game.')
+                   N' minutes, so the house cleared it. Seated humans have ',
+                   @SpectatorRetentionMinutes, N' minutes to reclaim their banked stacks.')
             FROM TexasHoldEm_Public.TexasHoldEm_Game;
         END
 
@@ -1079,44 +1096,21 @@ BEGIN
                AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
             BEGIN
                 SET @Notice = CONCAT(N'You are OUT with 0 chips. That identity stays busted for ',
-                    @OutRetentionMinutes, N' minutes; RESET or explicit NEWGAME clears the roster.');
+                    @OutRetentionMinutes, N' minutes; an administrator RESET clears the roster.');
                 SET @ReturnNow = 1;
             END
         END
 
-        /* Bound all retained humans at 64. A genuinely new join evicts the
-           oldest OUT identity first, then the stalest spectator, and never an
-           active seat. */
+        /* Bound all retained humans at 64 without breaking the promises that
+           make those rows exist. The expiry sweep above frees stale rows; an
+           unexpired bankroll or OUT lockout is never discarded just because
+           an unrelated new identity arrived. */
         IF @IdentityFound = 0 AND @ReturnNow = 0 AND @Action IS NULL
            AND (SELECT COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Identities) >= @MaxRetainedIdentities
         BEGIN
-            SELECT @IdentitiesToEvict = COUNT(*) - (@MaxRetainedIdentities - 1)
-            FROM TexasHoldEm_Public.TexasHoldEm_Identities;
-
-            DELETE @EvictedIdentities;
-            INSERT @EvictedIdentities (PlayerName)
-            SELECT TOP (@IdentitiesToEvict) i.PlayerName
-            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
-            WHERE i.PlayerRole IN ('OUT', 'SPECTATOR')
-              AND NOT EXISTS
-                  (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
-                   WHERE p.IsBot = 0 AND p.PlayerName = i.PlayerName)
-            ORDER BY CASE WHEN i.PlayerRole = 'OUT' THEN 0 ELSE 1 END,
-                     i.LastSeenAt, i.JoinedAt, i.IdentityId;
-
-            DELETE w
-            FROM TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
-            JOIN @EvictedIdentities AS e ON e.PlayerName = w.PlayerName;
-            DELETE i
-            FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
-            JOIN @EvictedIdentities AS e ON e.PlayerName = i.PlayerName;
-
-            IF (SELECT COUNT(*) FROM TexasHoldEm_Public.TexasHoldEm_Identities) >= @MaxRetainedIdentities
-            BEGIN
-                SET @Notice = N'The retained-identity roster is full of active players. You can watch, but a new player cannot join yet.';
-                SET @ReturnNow = 1;
-                SET @IsObserver = 1;
-            END
+            SET @Notice = N'The retained-identity roster is full of active bankrolls and lockouts. You can watch, but a new identity must wait for one to expire.';
+            SET @ReturnNow = 1;
+            SET @IsObserver = 1;
         END
 
         /* Find my seat: by session identity first (session_id + login_time),
@@ -2985,8 +2979,7 @@ ELSE IF @LeftTable = 1
 ELSE IF @GState = 'GameOver'
     INSERT @Prompt (Line) VALUES
         (N'GAME OVER. Run EXEC sp_TexasHoldEm_Public to open the next lobby while honoring retained bankrolls and OUT lockouts.'),
-        (N'Use @Action = ''NewGame'' only to discard retained identities and open a completely fresh roster.'),
-        (N'A database administrator can use @Action = ''Reset'' to abandon a stuck game at any time.');
+        (N'A database administrator can use @Action = ''Reset'' to discard retained identities or abandon a stuck game.');
 ELSE IF @GState = 'InHand' AND @SeatExists = 1 AND @TurnSeat = @MySeat
      AND @MyNeedsToAct = 1 AND @MyFolded = 0
 BEGIN

@@ -70,17 +70,17 @@ The four result sets keep the same order and shape in both modes.
 | `Leave` | Cash out (folds first if you're mid-hand) |
 | `Watch` | Spectate without taking a seat |
 | `Status` | Instant snapshot of the table — never blocks |
-| `NewGame` | Discard retained identities and open a completely fresh lobby after `GAME OVER` |
+| `NewGame` | Discard retained identities and open a completely fresh lobby after `GAME OVER` (database administrators only) |
 | `Reset` | Atomically abandon any table and open a fresh lobby (database administrators only) |
 | `Help` | Cheat sheet |
 
 Actions are case-insensitive. A normal join after `GAME OVER` starts the next
 lobby for backward compatibility while preserving unexpired `SPECTATOR`
-bankrolls and `OUT` lockouts. Explicit `NewGame` makes the destructive
-fresh-roster choice: like administrator `Reset`, it clears seats, waitlist
-reservations, retained identities, cards, bets, pot, and prior game log state
-under the game lock, then records the initiating database identity in the new
-log without including credentials.
+bankrolls and `OUT` lockouts. Administrator-only `NewGame` makes the destructive
+fresh-roster choice: like `Reset`, it clears seats, waitlist reservations,
+retained identities, cards, bets, pot, and prior game log state under the game
+lock, then records the initiating database identity in the new log without
+including credentials.
 
 ## House rules
 
@@ -89,8 +89,8 @@ log without including credentials.
 - A genuinely new identity starts with 1,000 chips. When that identity busts,
   it stays `OUT` for 60 minutes and cannot immediately collect another free
   stack. An automatic post-`GAME OVER` lobby preserves that lockout and any
-  unexpired spectator bankroll; explicit `NewGame` or administrator `Reset`
-  starts a fresh roster.
+  unexpired spectator bankroll; administrator `NewGame` or `Reset` starts a
+  fresh roster.
 - Bust every robot at the table and you keep your stack — that isn't a win
   condition, it's just a big pot. On the next hand, queued humans take open
   seats first, then fresh robots buy in for 1,000 each wherever chairs remain.
@@ -100,8 +100,9 @@ log without including credentials.
 - 60-second shot clock per decision: dawdle and you auto-check or auto-fold.
   Three timeouts cost your seat, but your actual remaining stack is retained
   as a `SPECTATOR` for 10 minutes so you can reconnect and request a seat.
-- Retained human identities are capped at 64. Admission evicts the oldest
-  `OUT` rows first, then stale spectators, and never an active seat.
+- Retained human identities are capped at 64. The ordinary expiry sweep frees
+  stale rows; admission never discards a live bankroll or `OUT` lockout, so a
+  new identity waits when all 64 retained entries are still active.
 - After a hand, the final table and transcript remain available until every
   participating human checks in or a 60-second acknowledgement deadline
   expires. Disconnected, departed, and busted identities cannot hold the
@@ -159,9 +160,10 @@ hostile and fluent in T-SQL — and changes the design accordingly:
 - **Boring names.** Player names are limited to letters, digits, single
   spaces, dots, dashes, and underscores — no control characters, quotes, or
   Unicode homoglyphs for forging log lines or impersonating players.
-- **Janitorial service.** Abandoned tables get swept after 30 minutes, the
-  log is trimmed so it doesn't grow forever, and waiting queries give up
-  after 30 minutes to hand their worker threads back.
+- **Janitorial service.** Abandoned tables get cleared after 30 minutes, with
+  seated human stacks banked for the ordinary 10-minute spectator-reclaim
+  window. The log is trimmed so it doesn't grow forever, and waiting queries
+  give up after 30 minutes to hand their worker threads back.
 
 Setup (as an admin, in the database that hosts the game): run the whole
 script — it creates the protected schema, five tables, certificate, player
