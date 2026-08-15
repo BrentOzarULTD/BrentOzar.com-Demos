@@ -345,6 +345,43 @@ test('pageshow on an ordinary load does not start a second loop', async function
     assert.equal(booted.win.timers.size, 1, 'still exactly one pending poll');
 });
 
+test('a hide/show pair before the first fetch resolves leaves one poll loop', async function () {
+    // pagehide only sets a flag; the request already awaiting fetch() keeps
+    // going. pageshow clears the flag and starts another. If the old one is
+    // still judged by state alone it looks current when it lands, renders,
+    // and schedules a second timer - two loops, and an older response able to
+    // overwrite a newer one.
+    const element = fakeViewer();
+    const pending = [];
+    const win = fakeWindow(function () {
+        return new Promise(function (_resolve, reject) {
+            pending.push(reject);
+        });
+    });
+
+    viewer_boot(element, win);
+    await drain();
+    assert.equal(pending.length, 1, 'the first request is in flight');
+
+    fire(win, 'pagehide');
+    fire(win, 'pageshow');
+    await drain();
+    assert.equal(pending.length, 2, 'resuming started a fresh request');
+
+    // Land the resumed request first, then the retired one.
+    pending[1](new Error('newer request failed'));
+    await drain();
+    pending[0](new Error('older request failed'));
+    await drain();
+
+    assert.equal(win.timers.size, 1, 'exactly one poll loop should survive');
+    // Two loops would have counted two failures and backed off to 20s.
+    assert.equal(
+        element.nodes['[data-role="status"]'].textContent,
+        'Dealer went missing · retrying in 10s'
+    );
+});
+
 test('a stopped viewer ignores pagehide and pageshow', async function () {
     const element = fakeViewer();
     const booted = await bootFailingViewer(element);

@@ -548,6 +548,12 @@
         let observer = null;
         let stopped = false;
         let paused = false;
+        /* Bumped whenever the loop is torn down or suspended. A refresh
+           captures it on entry and stands down if it no longer matches, so a
+           request that was already in flight when the page was hidden can't
+           render or reschedule after a resume has started a newer one. */
+        let generation = 0;
+        let activeController = null;
 
         const fitTable = function () {
             fit(viewer);
@@ -560,10 +566,17 @@
         }
         fitTable();
 
-        function clearPoll() {
+        /* Retires whatever is in flight: cancels the pending poll, aborts an
+           open request, and invalidates any refresh already past its await. */
+        function retireCurrentWork() {
+            generation += 1;
             if (timerId !== null) {
                 windowObject.clearTimeout(timerId);
                 timerId = null;
+            }
+            if (activeController !== null) {
+                activeController.abort();
+                activeController = null;
             }
         }
 
@@ -575,7 +588,7 @@
                 return;
             }
             stopped = true;
-            clearPoll();
+            retireCurrentWork();
             if (observer !== null) {
                 observer.disconnect();
             } else {
@@ -595,7 +608,7 @@
                 return;
             }
             paused = true;
-            clearPoll();
+            retireCurrentWork();
         }
 
         function handlePageShow() {
@@ -603,7 +616,7 @@
                 return;
             }
             paused = false;
-            clearPoll();
+            retireCurrentWork();
             refresh();
         }
 
@@ -612,6 +625,15 @@
             if (stopped || paused) {
                 return;
             }
+
+            /* This refresh's claim on the loop. Checked after every await:
+               state alone isn't enough, because a hide/show pair leaves
+               paused false again while this request is still outstanding. */
+            const myGeneration = generation;
+            const isCurrent = function () {
+                return !stopped && !paused && myGeneration === generation;
+            };
+
             /* The host page can swap the viewer out from under us - a
                client-side route change, a block editor re-render - and a
                detached element will never show another snapshot. Polling on
@@ -622,6 +644,7 @@
             }
 
             const controller = new windowObject.AbortController();
+            activeController = controller;
             const timeout = windowObject.setTimeout(function () {
                 controller.abort();
             }, requestTimeoutMilliseconds);
@@ -632,10 +655,11 @@
                     headers: requestHeaders(etag),
                     signal: controller.signal
                 });
-                /* Everything past the await can land after a stop() or a
-                   pagehide, and a stopped viewer must not be written to - it
-                   may be detached, or already restarted by a later boot(). */
-                if (stopped || paused) {
+                /* Everything past the await can land after a stop(), or after
+                   a hide/show pair that already started a newer refresh. A
+                   retired refresh must not write to the DOM - the element may
+                   be detached, and its response is older than the live one. */
+                if (!isCurrent()) {
                     return;
                 }
                 if (response.status === 304) {
@@ -660,7 +684,7 @@
                     etag = responseEtag;
                 }
                 const snapshot = await response.json();
-                if (stopped || paused) {
+                if (!isCurrent()) {
                     return;
                 }
                 consecutiveFailures = 0;
@@ -673,7 +697,9 @@
                 );
                 fitTable();
             } catch (error) {
-                if (stopped || paused) {
+                /* An abort from retireCurrentWork lands here too, and that's
+                   not a dealer that went missing. */
+                if (!isCurrent()) {
                     return;
                 }
                 consecutiveFailures += 1;
@@ -681,7 +707,10 @@
                 windowObject.console.error('Texas Hold Em viewer refresh failed.', error);
             } finally {
                 windowObject.clearTimeout(timeout);
-                if (!stopped && !paused) {
+                if (activeController === controller) {
+                    activeController = null;
+                }
+                if (isCurrent()) {
                     timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
                 }
             }
