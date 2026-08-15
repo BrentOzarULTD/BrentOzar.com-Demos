@@ -156,6 +156,13 @@ test('describeDelay reads as seconds under a minute and minutes above it', funct
     assert.equal(viewer.describeDelay(120000), '2m');
 });
 
+test('describeDelay never promises a shorter wait than the one scheduled', function () {
+    // 80s is a real backoff step; rounding it to '1m' under-reports the wait.
+    assert.equal(viewer.describeDelay(80000), '1m 20s');
+    assert.equal(viewer.describeDelay(90000), '1m 30s');
+    assert.equal(viewer.describeDelay(60000), '1m');
+});
+
 /* ------------------------------------------------------------------ *
  * Poll-loop harness. Enough of a window and a viewer element to drive
  * the real refresh loop through its failure paths without a DOM.
@@ -296,16 +303,85 @@ test('a viewer detached from the document stops polling on its own', async funct
     assert.equal(booted.win.timers.size, 0, 'a detached viewer should not reschedule');
 });
 
-test('pagehide stops the loop', async function () {
+function fire(win, type) {
+    (win.listeners.get(type) || []).slice().forEach(function (fn) {
+        fn();
+    });
+}
+
+test('pagehide pauses the loop instead of killing it', async function () {
     const element = fakeViewer();
     const booted = await bootFailingViewer(element);
 
     assert.equal(booted.win.timers.size, 1);
-    booted.win.listeners.get('pagehide').slice().forEach(function (fn) {
-        fn();
+    fire(booted.win, 'pagehide');
+
+    assert.equal(booted.win.timers.size, 0, 'the pending poll should be cleared');
+    // Still alive: the page may come back from the back/forward cache.
+    assert.equal(element.dataset.pokerViewerStarted, 'true');
+});
+
+test('pageshow resumes a viewer restored from the back/forward cache', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    fire(booted.win, 'pagehide');
+    assert.equal(booted.win.timers.size, 0);
+
+    fire(booted.win, 'pageshow');
+    await drain();
+
+    assert.equal(booted.win.timers.size, 1, 'the loop should be polling again');
+});
+
+test('pageshow on an ordinary load does not start a second loop', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    assert.equal(booted.win.timers.size, 1);
+    fire(booted.win, 'pageshow');
+    await drain();
+
+    assert.equal(booted.win.timers.size, 1, 'still exactly one pending poll');
+});
+
+test('a stopped viewer ignores pagehide and pageshow', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    booted.stop();
+    fire(booted.win, 'pageshow');
+    await drain();
+
+    assert.equal(booted.win.timers.size, 0, 'stop() is permanent');
+});
+
+test('a refresh that lands after stop() does not touch the DOM', async function () {
+    const element = fakeViewer();
+    let release = null;
+    const win = fakeWindow(function () {
+        return new Promise(function (resolve) {
+            release = function () {
+                resolve({
+                    ok: true,
+                    status: 304,
+                    headers: { get: function () { return '"x"'; } },
+                    json: function () { return Promise.resolve({}); }
+                });
+            };
+        });
     });
 
-    assert.equal(booted.win.timers.size, 0);
+    const stops = viewer_boot(element, win);
+    await drain();
+    element.nodes['[data-role="status"]'].textContent = 'UNTOUCHED';
+
+    stops[0]();          // stop while the fetch is still in flight
+    release();           // ...then let it resolve
+    await drain();
+
+    assert.equal(element.nodes['[data-role="status"]'].textContent, 'UNTOUCHED');
+    assert.equal(win.timers.size, 0);
 });
 
 test('boot refuses to start the same viewer twice', function () {

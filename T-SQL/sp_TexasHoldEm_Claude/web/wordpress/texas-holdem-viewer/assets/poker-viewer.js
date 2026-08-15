@@ -494,11 +494,20 @@
         );
     }
 
+    /* Exact, because the pill is a promise about when the table refreshes.
+       Rounding to whole minutes turned the 80-second backoff step into "1m",
+       which is a shorter wait than the one actually scheduled. */
     function describeDelay(milliseconds) {
         const seconds = Math.round(
             (milliseconds === undefined ? pollIntervalMilliseconds : milliseconds) / 1000
         );
-        return seconds < 60 ? seconds + 's' : Math.round(seconds / 60) + 'm';
+        if (seconds < 60) {
+            return seconds + 's';
+        }
+
+        const minutes = Math.floor(seconds / 60);
+        const remainder = seconds % 60;
+        return remainder === 0 ? minutes + 'm' : minutes + 'm ' + remainder + 's';
     }
 
     function statusText(game, stale, delayMilliseconds) {
@@ -538,6 +547,7 @@
         let timerId = null;
         let observer = null;
         let stopped = false;
+        let paused = false;
 
         const fitTable = function () {
             fit(viewer);
@@ -550,29 +560,56 @@
         }
         fitTable();
 
-        /* Idempotent: pagehide, an explicit caller, and the detached-element
-           check below can all land on it. */
+        function clearPoll() {
+            if (timerId !== null) {
+                windowObject.clearTimeout(timerId);
+                timerId = null;
+            }
+        }
+
+        /* Idempotent: an explicit caller and the detached-element check below
+           can both land on it. Permanent - use pause/resume for a page that
+           might come back. */
         function stop() {
             if (stopped) {
                 return;
             }
             stopped = true;
-            if (timerId !== null) {
-                windowObject.clearTimeout(timerId);
-                timerId = null;
-            }
+            clearPoll();
             if (observer !== null) {
                 observer.disconnect();
             } else {
                 windowObject.removeEventListener('resize', fitTable);
             }
-            windowObject.removeEventListener('pagehide', stop);
+            windowObject.removeEventListener('pagehide', handlePageHide);
+            windowObject.removeEventListener('pageshow', handlePageShow);
             delete viewer.dataset.pokerViewerStarted;
+        }
+
+        /* Navigating away isn't the same as being finished: the back/forward
+           cache can restore this exact page, listeners and closures intact.
+           Stopping outright would leave the visitor staring at a table frozen
+           at whatever it showed when they left, so pause instead. */
+        function handlePageHide() {
+            if (stopped || paused) {
+                return;
+            }
+            paused = true;
+            clearPoll();
+        }
+
+        function handlePageShow() {
+            if (stopped || !paused) {
+                return;
+            }
+            paused = false;
+            clearPoll();
+            refresh();
         }
 
         async function refresh() {
             timerId = null;
-            if (stopped) {
+            if (stopped || paused) {
                 return;
             }
             /* The host page can swap the viewer out from under us - a
@@ -595,6 +632,12 @@
                     headers: requestHeaders(etag),
                     signal: controller.signal
                 });
+                /* Everything past the await can land after a stop() or a
+                   pagehide, and a stopped viewer must not be written to - it
+                   may be detached, or already restarted by a later boot(). */
+                if (stopped || paused) {
+                    return;
+                }
                 if (response.status === 304) {
                     if (!lastGame) {
                         throw new Error('API returned HTTP 304 before the first snapshot.');
@@ -617,6 +660,9 @@
                     etag = responseEtag;
                 }
                 const snapshot = await response.json();
+                if (stopped || paused) {
+                    return;
+                }
                 consecutiveFailures = 0;
                 lastGame = render(viewer, snapshot);
                 updateStatus(
@@ -627,18 +673,22 @@
                 );
                 fitTable();
             } catch (error) {
+                if (stopped || paused) {
+                    return;
+                }
                 consecutiveFailures += 1;
                 updateStatus(viewer, lastGame, 'error', backoffDelay(consecutiveFailures));
                 windowObject.console.error('Texas Hold Em viewer refresh failed.', error);
             } finally {
                 windowObject.clearTimeout(timeout);
-                if (!stopped) {
+                if (!stopped && !paused) {
                     timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
                 }
             }
         }
 
-        windowObject.addEventListener('pagehide', stop);
+        windowObject.addEventListener('pagehide', handlePageHide);
+        windowObject.addEventListener('pageshow', handlePageShow);
         refresh();
         return stop;
     }
