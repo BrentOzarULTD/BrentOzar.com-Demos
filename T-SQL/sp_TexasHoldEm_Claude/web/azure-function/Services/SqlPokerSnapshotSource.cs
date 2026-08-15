@@ -35,9 +35,14 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
         // The viewer renders neither WhatNow nor History, so the default asks the procedure for
         // the least it will give us. ThisGame pulls every log row since the game started, which
         // on a long table is hundreds of strings that every polling browser downloads every ten
-        // seconds and throws away. Set PokerShowWhatHappened=ThisGame to put the play-by-play
-        // back in the payload for a viewer that wants to render it.
-        ShowWhatHappened = configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? "ThisTurn";
+        // seconds and throws away. Set PokerShowWhatHappened=ThisGame (this game) or AllHistory
+        // (everything retained) to put the play-by-play back for a viewer that renders it.
+        //
+        // Trimmed before validating: SQL Server ignores trailing spaces when comparing strings,
+        // so the procedure would happily accept "ThisGame " from an app setting that picked up a
+        // stray space. Refusing to start on a value the database would have taken is the wrong
+        // kind of strict.
+        ShowWhatHappened = (configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? "ThisTurn").Trim();
         if (!ShowWhatHappenedOptions.Contains(ShowWhatHappened, StringComparer.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(

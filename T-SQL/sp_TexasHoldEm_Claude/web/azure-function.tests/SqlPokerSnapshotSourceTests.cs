@@ -27,6 +27,19 @@ public sealed class SqlPokerSnapshotSourceTests
         Assert.Equal(configured, source.ShowWhatHappened);
     }
 
+    [Theory]
+    [InlineData("ThisGame ")]
+    [InlineData("  AllHistory")]
+    [InlineData("\tThisTurn\n")]
+    public void ShowWhatHappened_AcceptsSurroundingWhitespaceTheProcedureWouldIgnore(string configured)
+    {
+        // SQL Server ignores trailing spaces when comparing strings, so refusing to start on a
+        // value the procedure itself would accept is the wrong kind of strict.
+        var source = Create(("PokerShowWhatHappened", configured));
+
+        Assert.Equal(configured.Trim(), source.ShowWhatHappened);
+    }
+
     [Fact]
     public void ShowWhatHappened_RejectsAValueTheProcedureWouldReject()
     {
