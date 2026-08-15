@@ -146,8 +146,12 @@
     text-transform: uppercase;
 }
 
+/* The height tracks the width through the canvas aspect ratio, which is
+   exactly what the old inline height computed. Keeping it here means the
+   viewer's ResizeObserver callback never writes a layout-affecting style,
+   so it can't re-trigger itself. */
 .texas-holdem-viewer__scaler {
-    height: 820px;
+    aspect-ratio: 1340 / 820;
     margin: 0 auto;
     max-width: 1340px;
     position: relative;

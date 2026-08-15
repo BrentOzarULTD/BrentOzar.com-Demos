@@ -27,8 +27,10 @@
        long as somebody leaves the tab open. */
     const maxPollIntervalMilliseconds = 120000;
     const requestTimeoutMilliseconds = 25000;
+    /* The fixed canvas the table is drawn on, then scaled down to fit. The
+       matching height lives in the scaler's CSS aspect-ratio (1340 / 820);
+       change one and you must change the other. */
     const canvasWidth = 1340;
-    const canvasHeight = 820;
     const tableCenterX = 670;
     const tableCenterY = 410;
     const seatRadiusX = 500;
@@ -473,12 +475,15 @@
         return game;
     }
 
+    /* Writes the transform and nothing else. The scaler's height comes from
+       its CSS aspect-ratio, so this never affects layout - which is what
+       lets the ResizeObserver below watch the very element being scaled
+       without its own callback re-triggering it. */
     function fit(viewer) {
         const scaler = viewer.querySelector('[data-role="scaler"]');
         const table = viewer.querySelector('[data-role="table"]');
         const scale = Math.min(1, scaler.clientWidth / canvasWidth);
         table.style.transform = 'scale(' + scale + ')';
-        scaler.style.height = Math.round(canvasHeight * scale) + 'px';
         return scale;
     }
 
