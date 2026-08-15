@@ -1066,7 +1066,7 @@ BEGIN
                AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
             BEGIN
                 SET @Notice = CONCAT(N'You are OUT with 0 chips. That identity stays busted for ',
-                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the tournament roster.');
+                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the roster.');
                 SET @ReturnNow = 1;
             END
         END
@@ -2314,8 +2314,14 @@ BEGIN
               ON p.PlayerName = i.PlayerName
             WHERE p.IsBot = 0;
 
+            /* Announce both kinds of bust without pretending robots have a
+               retained identity or promising who will take the empty seat. */
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-            SELECT @GHand, CONCAT(PlayerName, N' is out of chips and is OUT; the identity cannot rebuy during retention.')
+            SELECT @GHand, CONCAT(PlayerName,
+                   CASE WHEN IsBot = 1
+                        THEN N' is out of chips and leaves the table.'
+                        ELSE N' is out of chips and is OUT; the identity cannot rebuy during retention.'
+                   END)
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
 
             /* Photograph the seats before they're cleared, so the Seat grid
@@ -2390,16 +2396,24 @@ BEGIN
                 VALUES (@GHand, N'No humans remain. The machines win. GAME OVER.');
                 UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
             END
-            ELSE IF @NumPlayers = 1 AND @ReturningHumans = 0
-                    AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Waitlist)
-            BEGIN
-                INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-                SELECT @GHand, CONCAT(N'*** ', PlayerName, N' WINS IT ALL with ', Chips, N' chips! GAME OVER. ***')
-                FROM TexasHoldEm_Public.TexasHoldEm_Players;
-                UPDATE TexasHoldEm_Public.TexasHoldEm_Game SET GameState = 'GameOver', TurnSeat = NULL;
-            END
             ELSE
             BEGIN
+                /* Everybody else just goes between hands - including a lone
+                   surviving human, who keeps the stack they won. The next-hand
+                   setup promotes queued humans first, then fills any remaining
+                   empty seats with robots, so clearing the table isn't game over. */
+
+                /* Mark the moment anyway. Clearing the table is the best thing
+                   that happens at this game, and without this the transcript
+                   goes straight from three robots going broke to a note about
+                   the acknowledgement deadline. It also explains where those
+                   robots went before the refill line lands one hand later. */
+                IF @NumPlayers = 1 AND @HumansLeft = 1
+                    INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
+                    SELECT @GHand, CONCAT(N'*** ', PlayerName, N' busts the whole table with ', Chips,
+                           N' chips! The table refills for the next hand. ***')
+                    FROM TexasHoldEm_Public.TexasHoldEm_Players;
+
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                 VALUES (@GHand, CONCAT(N'Waiting for participating humans to receive the result; the next hand starts after everyone checks in or ',
                         @BetweenHandsSeconds, N' seconds pass.'));
