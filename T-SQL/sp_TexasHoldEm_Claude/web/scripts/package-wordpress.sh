@@ -10,8 +10,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 web_dir="$(cd "${script_dir}/.." && pwd)"
 artifact_dir="${web_dir}/artifacts"
 
+artifact="${artifact_dir}/texas-holdem-viewer.zip"
+
 mkdir -p "${artifact_dir}"
 cd "${web_dir}/wordpress"
-zip -qr "${artifact_dir}/texas-holdem-viewer.zip" texas-holdem-viewer -x '*.DS_Store'
 
-echo "Created ${artifact_dir}/texas-holdem-viewer.zip"
+# zip only adds and updates entries, so a rebuild after deleting or renaming a
+# plugin file would keep shipping the old one. Start from nothing every time.
+rm -f "${artifact}"
+zip -qr "${artifact}" texas-holdem-viewer -x '*.DS_Store'
+
+echo "Created ${artifact}"
