@@ -297,6 +297,27 @@ IF COL_LENGTH(N'TexasHoldEm_Public.TexasHoldEm_Players', N'LastWonHand') IS NULL
         ADD LastWonHand int NOT NULL
             CONSTRAINT DF_TexasHoldEm_Players_LastWonHand DEFAULT (0) WITH VALUES;
 
+/* Whoever ran out of chips in the hand that just ended. The seat table has
+   to let them go the instant the hand is over - the chair belongs to the
+   next player, and a stack of zero can't be dealt in - but the results grid
+   that comes back with that showdown still owes an explanation. Without
+   this, calling an all-in and busting two opponents makes those opponents
+   vanish from the Seat result set while the play-by-play is still talking
+   about them. One row per busted seat, replaced at the end of every hand
+   and rendered only while HandNumber still matches. */
+IF OBJECT_ID(N'TexasHoldEm_Public.TexasHoldEm_HandBusts', N'U') IS NULL
+CREATE TABLE TexasHoldEm_Public.TexasHoldEm_HandBusts (
+    SeatNum tinyint NOT NULL
+        CONSTRAINT PK_TexasHoldEm_HandBusts PRIMARY KEY,
+    PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS NOT NULL,
+    IsBot bit NOT NULL,
+    HandNumber int NOT NULL,
+    /* Filled in only when the hand reached a showdown and these two cards
+       were already public in the play-by-play. Empty for anyone who folded
+       their way to zero: busting out is not a reason to expose a hand. */
+    Cards nvarchar(12) NOT NULL
+        CONSTRAINT DF_TexasHoldEm_HandBusts_Cards DEFAULT (N''));
+
 /* Humans who showed up after all 4 physical seats (and every robot) were
    already spoken for. First in line gets the next chair that opens - see
    @MaxHumans / @MaxWaitlist below for the caps. */
@@ -540,7 +561,7 @@ DECLARE @rc int,
         /* engine workspace */
         @Spins int, @StartHandNow bit, @HandDone bit,
         @NumPlayers int, @HumansLeft int, @ReturningHumans int, @NumInHand int, @Unfolded int, @ActiveBettors int,
-        @UnviewedHumans int,
+        @UnviewedHumans int, @BustedHumans int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
         @ActorRank1 int, @ActorRank2 int, @CanRaise bit, @Shove bit,
@@ -589,7 +610,10 @@ DECLARE @PlayerSnapshot TABLE
     Folded bit NOT NULL,
     AllIn bit NOT NULL,
     Cards nvarchar(12) NOT NULL,
-    LastWonHand int NOT NULL
+    LastWonHand int NOT NULL,
+    /* 1 = this seat is only here to be explained: they lost their last chip
+       in the hand that just ended and the seat table has already let go. */
+    Busted bit NOT NULL DEFAULT 0
 );
 DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS,
     SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32), Chips int);
@@ -843,6 +867,7 @@ BEGIN
 
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
             DELETE TexasHoldEm_Public.TexasHoldEm_Identities;
             DELETE TexasHoldEm_Public.TexasHoldEm_Log;
 
@@ -884,6 +909,7 @@ BEGIN
                < DATEADD(minute, -@AbandonedAfterMinutes, SYSDATETIME())
         BEGIN
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game
                SET GameState = 'GameOver', TurnSeat = NULL, NextHandStartsAt = NULL;
@@ -897,6 +923,7 @@ BEGIN
         IF (SELECT GameState FROM TexasHoldEm_Public.TexasHoldEm_Game) = 'GameOver' AND @Action IS NULL
         BEGIN
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
+            DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
             DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist;
             DELETE TexasHoldEm_Public.TexasHoldEm_Identities;
             UPDATE TexasHoldEm_Public.TexasHoldEm_Game
@@ -1752,9 +1779,24 @@ BEGIN
               AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
             SET @UnviewedHumans += @ReturningHumans;
 
+            /* Whoever just lost their last chip has no seat row to be counted
+               in - the bust cleanup deleted it - so without this they can't
+               hold the table open long enough to be told they busted. That is
+               not hypothetical: bust the last seated human while somebody is
+               on the waitlist and the game stays alive, nobody is "unviewed",
+               and the next hand is dealt in this same invocation, before the
+               busted player's session ever renders the hand they lost. */
+            SELECT @BustedHumans = COUNT(*)
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities
+            WHERE PlayerRole = 'OUT'
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
+            SET @UnviewedHumans += @BustedHumans;
+
             /* Keep the completed table and showdown transcript available
                until every still-relevant human participant has received it,
-               but never let a disconnected player block beyond the deadline. */
+               but never let a disconnected player block beyond the deadline.
+               A busted player who never comes back to look is covered by the
+               same deadline as a disconnected one. */
             IF @UnviewedHumans > 0 AND SYSDATETIME() < @NextHandAt BREAK;
             SET @StartHandNow = 1;
         END
@@ -2259,6 +2301,40 @@ BEGIN
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
             SELECT @GHand, CONCAT(PlayerName, N' is out of chips and is OUT; the identity cannot rebuy during retention.')
             FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
+
+            /* Photograph the seats before they're cleared, so the Seat grid
+               can still show who just went broke - and, if the hand went to
+               a showdown, the cards they went broke holding. Anyone who is
+               still in the seat table isn't in here, so the previous hand's
+               rows go away as soon as this hand produces its own. */
+            DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
+            INSERT TexasHoldEm_Public.TexasHoldEm_HandBusts (SeatNum, PlayerName, IsBot, HandNumber, Cards)
+            SELECT p.SeatNum, p.PlayerName, p.IsBot, @GHand,
+                   CASE WHEN h.HoleCards IS NOT NULL
+                             THEN CONCAT(c1.Display, N' ', c2.Display)
+                        ELSE N'' END
+            FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+            OUTER APPLY
+            (
+                SELECT CONVERT(varbinary(2), DecryptByCert
+                (
+                    CERT_ID(N'sp_TexasHoldEm_CardProtection_Claude'),
+                    p.HoleCardsEncrypted,
+                    N'Cl@udeTexasH0ldEm_2026!Cards'
+                )) AS HoleCards
+                WHERE p.HoleCardsEncrypted IS NOT NULL
+                  AND p.InHand = 1 AND p.Folded = 0
+                  /* Same rule the seat grid uses: cards are public only once
+                     the showdown has actually shown them. */
+                  AND EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Game
+                               WHERE ShowdownShown = 1)
+            ) AS h
+            LEFT JOIN #Poker_Cards AS c1
+              ON c1.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 1, 1))
+            LEFT JOIN #Poker_Cards AS c2
+              ON c2.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1))
+            WHERE p.Chips <= 0;
+
             DELETE TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
 
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
@@ -2617,6 +2693,26 @@ BEGIN
     LEFT JOIN #Poker_Cards AS c2
       ON c2.CardId = CONVERT(tinyint, SUBSTRING(h.HoleCards, 2, 1));
 
+    /* Add back whoever busted out of the hand this grid is describing. They
+       have no seat row anymore, so they're stitched in here at zero chips
+       rather than left as a hole in the table nobody can explain. Rows stop
+       appearing on their own when the next hand bumps the hand number, and a
+       seat that's already been handed to somebody else belongs to the new
+       occupant, not to the ghost. */
+    INSERT @PlayerSnapshot
+        (SeatNum, PlayerName, IsBot, Chips, BetThisRound, InHand, Folded, AllIn, Cards,
+         LastWonHand, Busted)
+    /* A busted seat never won the hand it busted in, so LastWonHand is 0. */
+    SELECT b.SeatNum, b.PlayerName, b.IsBot, 0, 0, 0, 0, 0,
+           /* Held to the same rule as a live seat's cards: a showdown is
+              public only once the hand it belongs to is over. */
+           CASE WHEN @GState IN ('BetweenHands', 'GameOver') THEN b.Cards
+                ELSE N'' END, 0, 1
+    FROM TexasHoldEm_Public.TexasHoldEm_HandBusts AS b
+    WHERE b.HandNumber = @GHand
+      AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+                       WHERE p.SeatNum = b.SeatNum);
+
     SET @TurnPlayerName = NULL;
     SELECT @TurnPlayerName = PlayerName
     FROM @PlayerSnapshot
@@ -2799,8 +2895,11 @@ SELECT [Seat] = p.SeatNum,
        /* Winner! outranks everything else here: the hand is over, so ALL IN
           and Folded are history, and the whole point of this column at that
           moment is to answer "who won?" without reading the play-by-play.
-          The flag ages out on its own - the next deal bumps the hand number. */
-       [Status] = CASE WHEN p.LastWonHand > 0 AND p.LastWonHand = @GHand THEN N'Winner!'
+          The flag ages out on its own - the next deal bumps the hand number.
+          Busted goes first only because a ghost seat has nothing else true
+          to say: it can't have won the hand it lost its last chip in. */
+       [Status] = CASE WHEN p.Busted = 1 THEN N'Busted out'
+                       WHEN p.LastWonHand > 0 AND p.LastWonHand = @GHand THEN N'Winner!'
                        WHEN p.Folded = 1 THEN N'Folded'
                        WHEN p.AllIn = 1 THEN N'ALL IN'
                        WHEN @GState = 'InHand' AND p.SeatNum = @TurnSeat THEN N'<<< deciding'
