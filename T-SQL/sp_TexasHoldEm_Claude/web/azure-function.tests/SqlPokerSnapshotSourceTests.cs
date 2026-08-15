@@ -31,13 +31,29 @@ public sealed class SqlPokerSnapshotSourceTests
     [InlineData("ThisGame ")]
     [InlineData("  AllHistory")]
     [InlineData("\tThisTurn\n")]
-    public void ShowWhatHappened_AcceptsSurroundingWhitespaceTheProcedureWouldIgnore(string configured)
+    public void ShowWhatHappened_TrimsTheConfiguredValue(string configured)
     {
-        // SQL Server ignores trailing spaces when comparing strings, so refusing to start on a
-        // value the procedure itself would accept is the wrong kind of strict.
+        // An app setting that picked up a stray space is something the procedure accepts without
+        // complaint, so the Function shouldn't refuse to start on it. Trimming here is broader
+        // than T-SQL's LTRIM/RTRIM - tabs and newlines too - which is safe because SQL only ever
+        // receives the normalized option.
         var source = Create(("PokerShowWhatHappened", configured));
 
         Assert.Equal(configured.Trim(), source.ShowWhatHappened);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\n")]
+    public void ShowWhatHappened_FallsBackToThisTurnWhenBlank(string configured)
+    {
+        // Matches sp_TexasHoldEm_Public.sql:607 —
+        //   SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
+        // A blank setting defaults there rather than erroring, so it must default here too.
+        var source = Create(("PokerShowWhatHappened", configured));
+
+        Assert.Equal("ThisTurn", source.ShowWhatHappened);
     }
 
     [Fact]

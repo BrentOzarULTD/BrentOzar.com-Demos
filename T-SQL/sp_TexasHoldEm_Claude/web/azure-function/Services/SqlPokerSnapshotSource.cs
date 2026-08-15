@@ -38,11 +38,20 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
         // seconds and throws away. Set PokerShowWhatHappened=ThisGame (this game) or AllHistory
         // (everything retained) to put the play-by-play back for a viewer that renders it.
         //
-        // Trimmed before validating: SQL Server ignores trailing spaces when comparing strings,
-        // so the procedure would happily accept "ThisGame " from an app setting that picked up a
-        // stray space. Refusing to start on a value the database would have taken is the wrong
-        // kind of strict.
-        ShowWhatHappened = (configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? "ThisTurn").Trim();
+        // Normalized to match what the procedure itself does with this parameter:
+        //
+        //     SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
+        //
+        // so surrounding whitespace is stripped and a blank value falls back to ThisTurn. The
+        // Function has no business refusing to start on input the database would have accepted.
+        // Trimming here is slightly broader than T-SQL's LTRIM/RTRIM - it takes tabs and newlines
+        // too - which is safe because SQL only ever sees the normalized option, never the raw
+        // setting.
+        var configuredShowWhatHappened =
+            (configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? string.Empty).Trim();
+        ShowWhatHappened = configuredShowWhatHappened.Length == 0
+            ? "ThisTurn"
+            : configuredShowWhatHappened;
         if (!ShowWhatHappenedOptions.Contains(ShowWhatHappened, StringComparer.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
