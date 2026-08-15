@@ -89,10 +89,11 @@ credentials.
   it stays `OUT` for 60 minutes and cannot immediately collect another free
   stack. A new game or administrator `Reset` starts a fresh roster.
 - Bust every robot at the table and you keep your stack — that isn't a win
-  condition, it's just a big pot. Fresh robots buy in for 1,000 each on the
-  next hand and play resumes. The game only ends when no humans are left, so
-  there's no "winning" it and a human on a heater can grow without bound.
-  Every refill mints new chips; this is a public demo table, not a tournament.
+  condition, it's just a big pot. On the next hand, queued humans take open
+  seats first, then fresh robots buy in for 1,000 each wherever chairs remain.
+  The game only ends when no humans are left, so there's no "winning" it and a
+  human on a heater can grow without bound. Every robot refill mints new chips;
+  this is a public demo table, not a tournament.
 - 60-second shot clock per decision: dawdle and you auto-check or auto-fold.
   Three timeouts cost your seat, but your actual remaining stack is retained
   as a `SPECTATOR` for 10 minutes so you can reconnect and request a seat.

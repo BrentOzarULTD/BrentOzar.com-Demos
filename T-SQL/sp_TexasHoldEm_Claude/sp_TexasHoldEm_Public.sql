@@ -1059,7 +1059,7 @@ BEGIN
                AND (@Action IS NULL OR @Action IN (N'Check', N'Call', N'Bet', N'Raise', N'AllIn', N'Fold', N'Leave'))
             BEGIN
                 SET @Notice = CONCAT(N'You are OUT with 0 chips. That identity stays busted for ',
-                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the tournament roster.');
+                    @OutRetentionMinutes, N' minutes; RESET or a new game clears the roster.');
                 SET @ReturnNow = 1;
             END
         END
@@ -2305,13 +2305,23 @@ BEGIN
               ON p.PlayerName = i.PlayerName
             WHERE p.IsBot = 0;
 
-            /* Humans only. Robots have no identity row and no retention, and
-               they buy straight back in at the next hand start - telling the
-               table Clippy "cannot rebuy during retention" is false, and it
-               reads especially badly one line above the refill message. */
+            /* Both kinds of bust get announced, but they aren't the same
+               event and can't share wording. Humans have an identity row and
+               a retention window; robots have neither, so telling the table
+               that Clippy "cannot rebuy during retention" is false - and
+               reads especially badly one line above the refill message. Filtering the robots
+               out of the human wording is only half the fix: drop them
+               entirely and an ordinary one-robot bust produces no message at
+               all, and the next hand's "Filling the empty seats with robots"
+               lists everyone seated rather than who's new, so it never
+               backfills the fact either. */
             INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
-            SELECT @GHand, CONCAT(PlayerName, N' is out of chips and is OUT; the identity cannot rebuy during retention.')
-            FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0 AND IsBot = 0;
+            SELECT @GHand, CONCAT(PlayerName,
+                   CASE WHEN IsBot = 1
+                        THEN N' is out of chips and leaves the table.'
+                        ELSE N' is out of chips and is OUT; the identity cannot rebuy during retention.'
+                   END)
+            FROM TexasHoldEm_Public.TexasHoldEm_Players WHERE Chips <= 0;
 
             /* Photograph the seats before they're cleared, so the Seat grid
                can still show who just went broke - and, if the hand went to
@@ -2389,8 +2399,8 @@ BEGIN
             BEGIN
                 /* Everybody else just goes between hands - including a lone
                    surviving human, who keeps the stack they won. The next-hand
-                   setup refills their empty seats with fresh robots, so busting
-                   the table isn't game over. */
+                   setup promotes queued humans first, then fills any remaining
+                   empty seats with robots, so clearing the table isn't game over. */
 
                 /* Mark the moment anyway. Clearing the table is the best thing
                    that happens at this game, and without this the transcript
@@ -2400,7 +2410,7 @@ BEGIN
                 IF @NumPlayers = 1 AND @HumansLeft = 1
                     INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
                     SELECT @GHand, CONCAT(N'*** ', PlayerName, N' busts the whole table with ', Chips,
-                           N' chips! Fresh robots buy in for the next hand. ***')
+                           N' chips! The table refills for the next hand. ***')
                     FROM TexasHoldEm_Public.TexasHoldEm_Players;
 
                 INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
