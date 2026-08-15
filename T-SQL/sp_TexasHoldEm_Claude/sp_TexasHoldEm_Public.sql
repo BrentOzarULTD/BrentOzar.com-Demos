@@ -918,12 +918,13 @@ BEGIN
         BEGIN
             /* The table is abandoned, not the bankroll. Bank each seated
                human's remaining stack under the same 10-minute SPECTATOR
-               retention used by a shot-clock removal. Starting the clock now
+               retention window used by a shot-clock removal, without labeling
+               the abandonment as a player timeout. Starting the clock now
                matters: their prior LastSeenAt is necessarily older than the
                abandonment threshold and would expire on this same call. */
             UPDATE i
                SET Chips = p.Chips, PlayerRole = 'SPECTATOR', WantsSeat = 0,
-                   TimedOut = 1, LastSeenAt = SYSDATETIME(),
+                   TimedOut = 0, LastSeenAt = SYSDATETIME(),
                    LastPlayedHand = p.LastPlayedHand,
                    LastViewedHand = p.LastViewedHand
             FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
