@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using PokerApi.Models;
@@ -13,6 +14,7 @@ public sealed class PokerSnapshotCache
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
     private CacheEntry? _entry;
+    private FailureEntry? _failure;
 
     public PokerSnapshotCache(
         IPokerSnapshotSource source,
@@ -44,6 +46,8 @@ public sealed class PokerSnapshotCache
             return entry.Snapshot;
         }
 
+        ThrowIfColdFailureIsCached();
+
         await _refreshLock.WaitAsync(cancellationToken);
         try
         {
@@ -54,6 +58,10 @@ public sealed class PokerSnapshotCache
                 return entry.Snapshot;
             }
 
+            // Checked again inside the lock: the holder ahead of us may have just recorded the
+            // failure, which is exactly the pile-up this guards against.
+            ThrowIfColdFailureIsCached();
+
             try
             {
                 // A disconnected HTTP client must not cancel a refresh shared by the whole Function instance.
@@ -63,10 +71,33 @@ public sealed class PokerSnapshotCache
                     refreshed with { Stale = false },
                     _timeProvider.GetUtcNow().Add(_ttl));
                 Volatile.Write(ref _entry, refreshedEntry);
+                Volatile.Write(ref _failure, null);
                 return refreshedEntry.Snapshot;
             }
-            catch (Exception exception) when (entry is not null && exception is not OperationCanceledException)
+            catch (OperationCanceledException)
             {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                if (entry is null)
+                {
+                    // Nothing cached and nothing to fall back on. Remember the failure for one TTL
+                    // so the requests queued on _refreshLock behind this one fail immediately
+                    // instead of each paying its own PokerCommandTimeoutSeconds against a database
+                    // we already know isn't answering.
+                    _logger.LogError(
+                        exception,
+                        "Poker snapshot refresh failed with no snapshot to fall back on; failing fast for {CacheSeconds}s.",
+                        CacheSeconds);
+                    Volatile.Write(
+                        ref _failure,
+                        new FailureEntry(
+                            ExceptionDispatchInfo.Capture(exception),
+                            _timeProvider.GetUtcNow().Add(_ttl)));
+                    throw;
+                }
+
                 _logger.LogWarning(exception, "Poker snapshot refresh failed; serving the last successful snapshot.");
                 var staleEntry = new CacheEntry(
                     entry.Snapshot with { Stale = true },
@@ -81,5 +112,18 @@ public sealed class PokerSnapshotCache
         }
     }
 
+    // Rethrows the cached cold-start failure, preserving the original stack trace, until the
+    // negative-cache window expires. One SQL attempt per window, however many callers arrive.
+    private void ThrowIfColdFailureIsCached()
+    {
+        var failure = Volatile.Read(ref _failure);
+        if (failure is not null && _timeProvider.GetUtcNow() < failure.ExpiresAt)
+        {
+            failure.Exception.Throw();
+        }
+    }
+
     private sealed record CacheEntry(PokerSnapshot Snapshot, DateTimeOffset ExpiresAt);
+
+    private sealed record FailureEntry(ExceptionDispatchInfo Exception, DateTimeOffset ExpiresAt);
 }
