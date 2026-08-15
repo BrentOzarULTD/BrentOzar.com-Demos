@@ -130,3 +130,190 @@ test('statusText describes live and stale snapshots', function () {
         'Last good snapshot · Hand 12 · The River · retrying in 10s'
     );
 });
+
+test('statusText reports the delay the loop is actually waiting', function () {
+    const game = { handNumber: 12, street: 'The River' };
+
+    assert.equal(
+        viewer.statusText(game, true, 120000),
+        'Last good snapshot · Hand 12 · The River · retrying in 2m'
+    );
+});
+
+test('backoffDelay doubles up to the cap and resets to the poll interval', function () {
+    assert.equal(viewer.backoffDelay(0), 10000);
+    assert.equal(viewer.backoffDelay(1), 10000);
+    assert.equal(viewer.backoffDelay(2), 20000);
+    assert.equal(viewer.backoffDelay(3), 40000);
+    assert.equal(viewer.backoffDelay(4), 80000);
+    assert.equal(viewer.backoffDelay(5), 120000);
+    assert.equal(viewer.backoffDelay(50), 120000);
+});
+
+test('describeDelay reads as seconds under a minute and minutes above it', function () {
+    assert.equal(viewer.describeDelay(10000), '10s');
+    assert.equal(viewer.describeDelay(45000), '45s');
+    assert.equal(viewer.describeDelay(120000), '2m');
+});
+
+/* ------------------------------------------------------------------ *
+ * Poll-loop harness. Enough of a window and a viewer element to drive
+ * the real refresh loop through its failure paths without a DOM.
+ * ------------------------------------------------------------------ */
+
+function drain() {
+    return new Promise(function (resolve) {
+        setImmediate(resolve);
+    });
+}
+
+function fakeWindow(fetchImpl) {
+    let nextTimerId = 1;
+    const timers = new Map();
+    const listeners = new Map();
+
+    return {
+        timers: timers,
+        listeners: listeners,
+        fetch: fetchImpl,
+        console: { error: function () {} },
+        AbortController: function AbortController() {
+            this.signal = {};
+            this.abort = function () {};
+        },
+        setTimeout: function (fn, delay) {
+            const id = nextTimerId += 1;
+            timers.set(id, { fn: fn, delay: delay });
+            return id;
+        },
+        clearTimeout: function (id) {
+            timers.delete(id);
+        },
+        addEventListener: function (type, fn) {
+            if (!listeners.has(type)) {
+                listeners.set(type, []);
+            }
+            listeners.get(type).push(fn);
+        },
+        removeEventListener: function (type, fn) {
+            const registered = listeners.get(type) || [];
+            const index = registered.indexOf(fn);
+            if (index >= 0) {
+                registered.splice(index, 1);
+            }
+        }
+    };
+}
+
+function fakeViewer() {
+    const nodes = {
+        '[data-role="status"]': { textContent: '' },
+        '[data-role="status-dot"]': { dataset: {} },
+        '[data-role="scaler"]': { clientWidth: 1340, style: {} },
+        '[data-role="table"]': { style: {} }
+    };
+
+    return {
+        dataset: { endpoint: 'https://example.test/api/poker/state' },
+        isConnected: true,
+        nodes: nodes,
+        querySelector: function (selector) {
+            return nodes[selector] || null;
+        }
+    };
+}
+
+function fakeDocument(viewer) {
+    return { querySelectorAll: function () { return [viewer]; } };
+}
+
+async function bootFailingViewer(viewer) {
+    const win = fakeWindow(function () {
+        return Promise.reject(new Error('the dealer is out'));
+    });
+    const stops = viewer_boot(viewer, win);
+    await drain();
+    return { win: win, stop: stops[0] };
+}
+
+function viewer_boot(element, win) {
+    return viewer.boot(fakeDocument(element), win);
+}
+
+// Fires the single pending poll timer and returns the delay it waited.
+async function fireNextPoll(win) {
+    const entries = Array.from(win.timers.entries());
+    assert.equal(entries.length, 1, 'exactly one poll timer should be pending');
+    const [id, timer] = entries[0];
+    win.timers.delete(id);
+    timer.fn();
+    await drain();
+    return timer.delay;
+}
+
+test('the poll loop backs off while the API keeps failing', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    // First failure already scheduled a retry at the ordinary interval.
+    assert.equal(await fireNextPoll(booted.win), 10000);
+    assert.equal(await fireNextPoll(booted.win), 20000);
+    assert.equal(await fireNextPoll(booted.win), 40000);
+    assert.equal(await fireNextPoll(booted.win), 80000);
+    assert.equal(await fireNextPoll(booted.win), 120000);
+    assert.equal(await fireNextPoll(booted.win), 120000);
+
+    assert.equal(
+        element.nodes['[data-role="status"]'].textContent,
+        'Dealer went missing · retrying in 2m'
+    );
+    assert.equal(element.nodes['[data-role="status-dot"]'].dataset.state, 'error');
+});
+
+test('stopping the viewer cancels the pending poll and stays stopped', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    assert.equal(booted.win.timers.size, 1);
+    booted.stop();
+
+    assert.equal(booted.win.timers.size, 0, 'the pending poll should be cleared');
+    assert.equal(element.dataset.pokerViewerStarted, undefined);
+    assert.deepEqual(booted.win.listeners.get('pagehide'), []);
+
+    booted.stop();
+    assert.equal(booted.win.timers.size, 0, 'stopping twice should be harmless');
+});
+
+test('a viewer detached from the document stops polling on its own', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    assert.equal(booted.win.timers.size, 1);
+    element.isConnected = false;
+    await fireNextPoll(booted.win);
+
+    assert.equal(booted.win.timers.size, 0, 'a detached viewer should not reschedule');
+});
+
+test('pagehide stops the loop', async function () {
+    const element = fakeViewer();
+    const booted = await bootFailingViewer(element);
+
+    assert.equal(booted.win.timers.size, 1);
+    booted.win.listeners.get('pagehide').slice().forEach(function (fn) {
+        fn();
+    });
+
+    assert.equal(booted.win.timers.size, 0);
+});
+
+test('boot refuses to start the same viewer twice', function () {
+    const element = fakeViewer();
+    const win = fakeWindow(function () {
+        return Promise.reject(new Error('the dealer is out'));
+    });
+
+    assert.equal(viewer_boot(element, win).length, 1);
+    assert.equal(viewer_boot(element, win).length, 0);
+});

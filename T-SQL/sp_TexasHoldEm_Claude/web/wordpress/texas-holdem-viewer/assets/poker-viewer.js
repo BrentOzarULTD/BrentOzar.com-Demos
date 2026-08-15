@@ -22,6 +22,10 @@
     'use strict';
 
     const pollIntervalMilliseconds = 10000;
+    /* A dealer that's been missing for two minutes is not coming back in ten
+       seconds. Back off rather than hammering a known-dead endpoint for as
+       long as somebody leaves the tab open. */
+    const maxPollIntervalMilliseconds = 120000;
     const requestTimeoutMilliseconds = 25000;
     const canvasWidth = 1340;
     const canvasHeight = 820;
@@ -478,51 +482,108 @@
         return scale;
     }
 
-    function statusText(game, stale) {
-        const hand = game.handNumber === null ? 'Waiting' : 'Hand ' + game.handNumber;
-        if (stale) {
-            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · retrying in 10s';
+    /* Doubling, capped. Zero failures means the happy path, so the very first
+       retry after a failure is still the ordinary ten seconds. */
+    function backoffDelay(consecutiveFailures) {
+        if (!(consecutiveFailures > 0)) {
+            return pollIntervalMilliseconds;
         }
-        return hand + ' · ' + game.street + ' · refresh in 10s';
+        return Math.min(
+            pollIntervalMilliseconds * Math.pow(2, consecutiveFailures - 1),
+            maxPollIntervalMilliseconds
+        );
     }
 
-    function updateStatus(viewer, game, state) {
+    function describeDelay(milliseconds) {
+        const seconds = Math.round(
+            (milliseconds === undefined ? pollIntervalMilliseconds : milliseconds) / 1000
+        );
+        return seconds < 60 ? seconds + 's' : Math.round(seconds / 60) + 'm';
+    }
+
+    function statusText(game, stale, delayMilliseconds) {
+        const delay = describeDelay(delayMilliseconds);
+        const hand = game.handNumber === null ? 'Waiting' : 'Hand ' + game.handNumber;
+        if (stale) {
+            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · retrying in ' + delay;
+        }
+        return hand + ' · ' + game.street + ' · refresh in ' + delay;
+    }
+
+    function updateStatus(viewer, game, state, delayMilliseconds) {
         const status = viewer.querySelector('[data-role="status"]');
         const dot = viewer.querySelector('[data-role="status-dot"]');
 
         if (state === 'error') {
-            status.textContent = 'Dealer went missing · retrying in 10s';
+            status.textContent = 'Dealer went missing · retrying in ' + describeDelay(delayMilliseconds);
             dot.dataset.state = 'error';
             return;
         }
 
         const stale = state === 'stale';
-        status.textContent = statusText(game, stale);
+        status.textContent = statusText(game, stale, delayMilliseconds);
         dot.dataset.state = stale ? 'stale' : 'live';
     }
 
     function start(viewer, windowObject) {
         if (viewer.dataset.pokerViewerStarted === 'true') {
-            return;
+            return null;
         }
         viewer.dataset.pokerViewerStarted = 'true';
 
         const endpoint = viewer.dataset.endpoint;
         let lastGame = null;
         let etag = null;
+        let consecutiveFailures = 0;
+        let timerId = null;
+        let observer = null;
+        let stopped = false;
 
         const fitTable = function () {
             fit(viewer);
         };
         if (typeof windowObject.ResizeObserver === 'function') {
-            const observer = new windowObject.ResizeObserver(fitTable);
+            observer = new windowObject.ResizeObserver(fitTable);
             observer.observe(viewer.querySelector('[data-role="scaler"]'));
         } else {
             windowObject.addEventListener('resize', fitTable);
         }
         fitTable();
 
+        /* Idempotent: pagehide, an explicit caller, and the detached-element
+           check below can all land on it. */
+        function stop() {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            if (timerId !== null) {
+                windowObject.clearTimeout(timerId);
+                timerId = null;
+            }
+            if (observer !== null) {
+                observer.disconnect();
+            } else {
+                windowObject.removeEventListener('resize', fitTable);
+            }
+            windowObject.removeEventListener('pagehide', stop);
+            delete viewer.dataset.pokerViewerStarted;
+        }
+
         async function refresh() {
+            timerId = null;
+            if (stopped) {
+                return;
+            }
+            /* The host page can swap the viewer out from under us - a
+               client-side route change, a block editor re-render - and a
+               detached element will never show another snapshot. Polling on
+               its behalf just keeps it, and this closure, alive. */
+            if (viewer.isConnected === false) {
+                stop();
+                return;
+            }
+
             const controller = new windowObject.AbortController();
             const timeout = windowObject.setTimeout(function () {
                 controller.abort();
@@ -535,11 +596,16 @@
                     signal: controller.signal
                 });
                 if (response.status === 304) {
-                    if (lastGame) {
-                        updateStatus(viewer, lastGame, lastGame.stale ? 'stale' : 'live');
-                    } else {
+                    if (!lastGame) {
                         throw new Error('API returned HTTP 304 before the first snapshot.');
                     }
+                    consecutiveFailures = 0;
+                    updateStatus(
+                        viewer,
+                        lastGame,
+                        lastGame.stale ? 'stale' : 'live',
+                        pollIntervalMilliseconds
+                    );
                     return;
                 }
                 if (!response.ok) {
@@ -551,29 +617,47 @@
                     etag = responseEtag;
                 }
                 const snapshot = await response.json();
+                consecutiveFailures = 0;
                 lastGame = render(viewer, snapshot);
-                updateStatus(viewer, lastGame, snapshot.stale === true ? 'stale' : 'live');
+                updateStatus(
+                    viewer,
+                    lastGame,
+                    snapshot.stale === true ? 'stale' : 'live',
+                    pollIntervalMilliseconds
+                );
                 fitTable();
             } catch (error) {
-                updateStatus(viewer, lastGame, 'error');
+                consecutiveFailures += 1;
+                updateStatus(viewer, lastGame, 'error', backoffDelay(consecutiveFailures));
                 windowObject.console.error('Texas Hold Em viewer refresh failed.', error);
             } finally {
                 windowObject.clearTimeout(timeout);
-                windowObject.setTimeout(refresh, pollIntervalMilliseconds);
+                if (!stopped) {
+                    timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
+                }
             }
         }
 
+        windowObject.addEventListener('pagehide', stop);
         refresh();
+        return stop;
     }
 
     function boot(documentObject, windowObject) {
+        const stops = [];
         documentObject.querySelectorAll('[data-texas-holdem-viewer]').forEach(function (viewer) {
-            start(viewer, windowObject);
+            const stop = start(viewer, windowObject);
+            if (stop) {
+                stops.push(stop);
+            }
         });
+        return stops;
     }
 
     return {
+        backoffDelay: backoffDelay,
         boot: boot,
+        describeDelay: describeDelay,
         fit: fit,
         formatMoney: formatMoney,
         normalizeSnapshot: normalizeSnapshot,
