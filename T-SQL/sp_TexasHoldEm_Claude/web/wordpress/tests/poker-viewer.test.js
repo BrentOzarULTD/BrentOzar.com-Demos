@@ -338,6 +338,30 @@ test('the pill counts the wait down instead of freezing on the scheduled delay',
     booted.stop();
 });
 
+test('the pill stops promising a countdown the moment the request goes out', async function () {
+    const element = fakeViewer();
+    let impl = function () {
+        return Promise.reject(new Error('the dealer is out'));
+    };
+    const win = fakeWindow(function () {
+        return impl();
+    });
+    viewer_boot(element, win);
+    await drain();
+
+    const pill = element.nodes['[data-role="status"]'];
+    assert.equal(pill.textContent, 'Dealer went missing · retrying in 10s');
+
+    /* Next poll hangs, so the request is in flight with no tick in between -
+       exactly the window where the pill used to keep counting down. */
+    impl = function () {
+        return new Promise(function () {});
+    };
+    await fireNextPoll(win);
+
+    assert.equal(pill.textContent, 'Dealer went missing · retrying now');
+});
+
 test('a paused viewer stops ticking its countdown', async function () {
     const element = fakeViewer();
     const booted = await bootFailingViewer(element);

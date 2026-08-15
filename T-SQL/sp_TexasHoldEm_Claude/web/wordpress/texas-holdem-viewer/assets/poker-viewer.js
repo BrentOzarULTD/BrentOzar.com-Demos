@@ -684,8 +684,16 @@
             if (stopped || paused) {
                 return;
             }
-            /* The wait is over and the request is about to go out. */
+            /* The wait is over and the request is about to go out. Repaint
+               now rather than leaving it to the next tick: the poll timer can
+               fire between ticks (and pageshow refreshes immediately, and a
+               host without setInterval never ticks at all), and "refresh in
+               1s" over a request that's already in flight is the same lie
+               this countdown exists to stop telling. */
             remainingMilliseconds = 0;
+            if (statusPainted) {
+                updateStatus(viewer, statusGame, statusState, 0);
+            }
 
             /* This refresh's claim on the loop. Checked after every await:
                state alone isn't enough, because a hide/show pair leaves
