@@ -27,6 +27,9 @@
        long as somebody leaves the tab open. */
     const maxPollIntervalMilliseconds = 120000;
     const requestTimeoutMilliseconds = 25000;
+    /* How often the pill redraws its own countdown. Only ever repaints text -
+       it never fetches, and it never schedules a poll. */
+    const countdownIntervalMilliseconds = 1000;
     /* The fixed canvas the table is drawn on, then scaled down to fit. The
        matching height lives in the scaler's CSS aspect-ratio (1340 / 820);
        change one and you must change the other. */
@@ -518,13 +521,24 @@
         return remainder === 0 ? minutes + 'm' : minutes + 'm ' + remainder + 's';
     }
 
+    /* The pill counts down, so zero doesn't mean "due in no time at all" - it
+       means the wait is over and the request is already out. Saying "refresh
+       in 0s" for as long as the fetch takes is how a live page looks stuck. */
+    function waitLabel(prefix, activeText, delayMilliseconds) {
+        const milliseconds = delayMilliseconds === undefined
+            ? pollIntervalMilliseconds
+            : delayMilliseconds;
+        return milliseconds <= 0 ? activeText : prefix + describeDelay(milliseconds);
+    }
+
     function statusText(game, stale, delayMilliseconds) {
-        const delay = describeDelay(delayMilliseconds);
         const hand = game.handNumber === null ? 'Waiting' : 'Hand ' + game.handNumber;
         if (stale) {
-            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · retrying in ' + delay;
+            return 'Last good snapshot · ' + hand + ' · ' + game.street + ' · '
+                + waitLabel('retrying in ', 'retrying now', delayMilliseconds);
         }
-        return hand + ' · ' + game.street + ' · refresh in ' + delay;
+        return hand + ' · ' + game.street + ' · '
+            + waitLabel('refresh in ', 'refreshing', delayMilliseconds);
     }
 
     function updateStatus(viewer, game, state, delayMilliseconds) {
@@ -532,7 +546,8 @@
         const dot = viewer.querySelector('[data-role="status-dot"]');
 
         if (state === 'error') {
-            status.textContent = 'Dealer went missing · retrying in ' + describeDelay(delayMilliseconds);
+            status.textContent = 'Dealer went missing · '
+                + waitLabel('retrying in ', 'retrying now', delayMilliseconds);
             dot.dataset.state = 'error';
             return;
         }
@@ -562,6 +577,16 @@
            render or reschedule after a resume has started a newer one. */
         let generation = 0;
         let activeController = null;
+        /* The pill promises a time, so it has to tick. Everything needed to
+           redraw it between polls: what was last shown, and how much of the
+           scheduled wait is left. Counted down rather than read off a clock,
+           so a throttled tab drifts instead of lying, and every completed
+           poll resets it to the real scheduled delay anyway. */
+        let statusPainted = false;
+        let statusGame = null;
+        let statusState = 'live';
+        let remainingMilliseconds = 0;
+        let countdownId = null;
 
         const fitTable = function () {
             fit(viewer);
@@ -573,6 +598,28 @@
             windowObject.addEventListener('resize', fitTable);
         }
         fitTable();
+
+        if (typeof windowObject.setInterval === 'function') {
+            countdownId = windowObject.setInterval(tickCountdown, countdownIntervalMilliseconds);
+        }
+
+        /* Every status write goes through here so the ticker below can redraw
+           the same line a second later without re-deriving it. */
+        function showStatus(game, state, delayMilliseconds) {
+            statusPainted = true;
+            statusGame = game;
+            statusState = state;
+            remainingMilliseconds = delayMilliseconds;
+            updateStatus(viewer, game, state, delayMilliseconds);
+        }
+
+        function tickCountdown() {
+            if (stopped || paused || !statusPainted) {
+                return;
+            }
+            remainingMilliseconds = Math.max(0, remainingMilliseconds - countdownIntervalMilliseconds);
+            updateStatus(viewer, statusGame, statusState, remainingMilliseconds);
+        }
 
         /* Retires whatever is in flight: cancels the pending poll, aborts an
            open request, and invalidates any refresh already past its await. */
@@ -597,6 +644,10 @@
             }
             stopped = true;
             retireCurrentWork();
+            if (countdownId !== null) {
+                windowObject.clearInterval(countdownId);
+                countdownId = null;
+            }
             if (observer !== null) {
                 observer.disconnect();
             } else {
@@ -632,6 +683,16 @@
             timerId = null;
             if (stopped || paused) {
                 return;
+            }
+            /* The wait is over and the request is about to go out. Repaint
+               now rather than leaving it to the next tick: the poll timer can
+               fire between ticks (and pageshow refreshes immediately, and a
+               host without setInterval never ticks at all), and "refresh in
+               1s" over a request that's already in flight is the same lie
+               this countdown exists to stop telling. */
+            remainingMilliseconds = 0;
+            if (statusPainted) {
+                updateStatus(viewer, statusGame, statusState, 0);
             }
 
             /* This refresh's claim on the loop. Checked after every await:
@@ -690,8 +751,7 @@
                         throw new Error('API returned HTTP 304 before the first snapshot.');
                     }
                     consecutiveFailures = 0;
-                    updateStatus(
-                        viewer,
+                    showStatus(
                         lastGame,
                         lastGame.stale ? 'stale' : 'live',
                         pollIntervalMilliseconds
@@ -712,8 +772,7 @@
                 }
                 consecutiveFailures = 0;
                 lastGame = render(viewer, snapshot);
-                updateStatus(
-                    viewer,
+                showStatus(
                     lastGame,
                     snapshot.stale === true ? 'stale' : 'live',
                     pollIntervalMilliseconds
@@ -726,7 +785,7 @@
                     return;
                 }
                 consecutiveFailures += 1;
-                updateStatus(viewer, lastGame, 'error', backoffDelay(consecutiveFailures));
+                showStatus(lastGame, 'error', backoffDelay(consecutiveFailures));
                 windowObject.console.error('Texas Hold Em viewer refresh failed.', error);
             } finally {
                 windowObject.clearTimeout(timeout);
@@ -734,7 +793,9 @@
                     activeController = null;
                 }
                 if (stillLive()) {
-                    timerId = windowObject.setTimeout(refresh, backoffDelay(consecutiveFailures));
+                    const delay = backoffDelay(consecutiveFailures);
+                    remainingMilliseconds = delay;
+                    timerId = windowObject.setTimeout(refresh, delay);
                 }
             }
         }
