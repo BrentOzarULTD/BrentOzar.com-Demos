@@ -561,7 +561,7 @@ DECLARE @rc int,
         /* engine workspace */
         @Spins int, @StartHandNow bit, @HandDone bit,
         @NumPlayers int, @HumansLeft int, @ReturningHumans int, @NumInHand int, @Unfolded int, @ActiveBettors int,
-        @UnviewedHumans int,
+        @UnviewedHumans int, @BustedHumans int,
         @PrevDealer tinyint, @ActorSeat tinyint, @ActorBot bit, @ActorName nvarchar(30),
         @ActorChips int, @ActorBet int, @ActorStrikes tinyint,
         @ActorRank1 int, @ActorRank2 int, @CanRaise bit, @Shove bit,
@@ -1779,9 +1779,24 @@ BEGIN
               AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
             SET @UnviewedHumans += @ReturningHumans;
 
+            /* Whoever just lost their last chip has no seat row to be counted
+               in - the bust cleanup deleted it - so without this they can't
+               hold the table open long enough to be told they busted. That is
+               not hypothetical: bust the last seated human while somebody is
+               on the waitlist and the game stays alive, nobody is "unviewed",
+               and the next hand is dealt in this same invocation, before the
+               busted player's session ever renders the hand they lost. */
+            SELECT @BustedHumans = COUNT(*)
+            FROM TexasHoldEm_Public.TexasHoldEm_Identities
+            WHERE PlayerRole = 'OUT'
+              AND LastPlayedHand = @GHand AND LastViewedHand < @GHand;
+            SET @UnviewedHumans += @BustedHumans;
+
             /* Keep the completed table and showdown transcript available
                until every still-relevant human participant has received it,
-               but never let a disconnected player block beyond the deadline. */
+               but never let a disconnected player block beyond the deadline.
+               A busted player who never comes back to look is covered by the
+               same deadline as a disconnected one. */
             IF @UnviewedHumans > 0 AND SYSDATETIME() < @NextHandAt BREAK;
             SET @StartHandNow = 1;
         END
@@ -2688,7 +2703,11 @@ BEGIN
         (SeatNum, PlayerName, IsBot, Chips, BetThisRound, InHand, Folded, AllIn, Cards,
          LastWonHand, Busted)
     /* A busted seat never won the hand it busted in, so LastWonHand is 0. */
-    SELECT b.SeatNum, b.PlayerName, b.IsBot, 0, 0, 0, 0, 0, b.Cards, 0, 1
+    SELECT b.SeatNum, b.PlayerName, b.IsBot, 0, 0, 0, 0, 0,
+           /* Held to the same rule as a live seat's cards: a showdown is
+              public only once the hand it belongs to is over. */
+           CASE WHEN @GState IN ('BetweenHands', 'GameOver') THEN b.Cards
+                ELSE N'' END, 0, 1
     FROM TexasHoldEm_Public.TexasHoldEm_HandBusts AS b
     WHERE b.HandNumber = @GHand
       AND NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
