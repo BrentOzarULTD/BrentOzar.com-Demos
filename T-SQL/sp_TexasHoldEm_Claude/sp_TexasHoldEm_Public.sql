@@ -619,6 +619,13 @@ DECLARE @Promoted TABLE (WaitId int, SeatNum tinyint, PlayerName nvarchar(30) CO
     SessionId int, SessionLoginTime datetime2, PasswordSalt varbinary(16), PasswordHash varbinary(32), Chips int);
 DECLARE @EvictedIdentities TABLE
     (PlayerName nvarchar(30) COLLATE Latin1_General_100_CI_AS PRIMARY KEY);
+/* Robots seated by the deal below. This exists instead of @@ROWCOUNT because
+   a client driver can transparently recover a broken idle Azure SQL connection
+   before this batch starts. The first batch after recovery cannot read the
+   previous connection's rowcount: doing so raises Msg 4083. The lobby happens
+   to reach that read only when its 60-second join window closes. OUTPUT records
+   exactly what this INSERT did without depending on connection session state. */
+DECLARE @SeatedBots TABLE (SeatNum tinyint PRIMARY KEY);
 
 /* A deck of cards. CardId 0-51: rank = CardId / 4 + 2 (2..14), suit = CardId % 4. */
 CREATE TABLE #Poker_Cards (CardId tinyint PRIMARY KEY, CardRank int, CardSuit tinyint, Display nvarchar(3));
@@ -1882,9 +1889,11 @@ BEGIN
                 WHERE NOT EXISTS (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players p
                                    WHERE p.PlayerName = b.BotName))
             INSERT TexasHoldEm_Public.TexasHoldEm_Players (SeatNum, PlayerName, SessionId, IsBot, Chips)
+            OUTPUT inserted.SeatNum INTO @SeatedBots (SeatNum)
             SELECT f.SeatNum, b.BotName, 0, 1, @StartingChips
             FROM freeseats f JOIN bots b ON b.rn = f.rn;
-            SET @BotsAdded = @@ROWCOUNT;
+            SELECT @BotsAdded = COUNT(*) FROM @SeatedBots;
+            DELETE @SeatedBots;
 
             IF @BotsAdded > 0
             BEGIN
