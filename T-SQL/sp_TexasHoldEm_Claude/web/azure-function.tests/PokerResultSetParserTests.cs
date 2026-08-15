@@ -28,17 +28,20 @@ public sealed class PokerResultSetParserTests
     [Fact]
     public async Task ParseAsync_ReadsColumnsByNameRegardlessOfTheirOrder()
     {
-        // The parser's column check is a set, so it accepts any ordering. This pins that the
-        // reads agree with it: they must be by name, never by position. Reading positionally -
-        // which CommandBehavior.SequentialAccess forces - would pass the check and then throw.
+        // The parser's column check is a set, so it accepts any ordering, and the reads have to
+        // agree with it. CommandBehavior.SequentialAccess doesn't change how ordinals are looked
+        // up - it constrains value access to ascending ordinal order - so under it a reordered
+        // result set passes this check and then throws on the first backwards read.
+        var generatedAt = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var dataSet = BuildValidDataSet();
         dataSet.Tables[0].Columns["Stage"]!.SetOrdinal(0);
         dataSet.Tables[0].Columns["Your Chips"]!.SetOrdinal(1);
         dataSet.Tables[1].Columns["Status"]!.SetOrdinal(0);
         using var reader = dataSet.CreateDataReader();
 
-        var result = await PokerResultSetParser.ParseAsync(reader, DateTimeOffset.UtcNow, CancellationToken.None);
+        var result = await PokerResultSetParser.ParseAsync(reader, generatedAt, CancellationToken.None);
 
+        Assert.Equal(generatedAt, result.GeneratedAt);
         Assert.Equal(7, result.Hand.HandNumber);
         Assert.Equal("Flop betting", result.Hand.Stage);
         Assert.Equal(180, result.Hand.Pot);
