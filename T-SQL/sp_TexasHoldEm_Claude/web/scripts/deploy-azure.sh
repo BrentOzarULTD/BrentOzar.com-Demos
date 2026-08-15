@@ -60,9 +60,18 @@ fi
 
 # The connection string must not reach az's argv: for the life of the call,
 # anything in the process table is readable by every other user on the box.
-# --settings @file keeps it out. JSON only requires backslashes and double
-# quotes to be escaped here - a connection string carries no control
-# characters - so this needs no JSON tooling the deploy box might not have.
+# --settings @file keeps it out.
+#
+# Escaping backslashes and double quotes is then enough to build the JSON by
+# hand, with no dependency on a JSON tool the deploy box might not have - but
+# only because a connection string has no control characters in it. Check that
+# rather than assume it: a stray newline would otherwise produce invalid JSON
+# and an az parse error that says nothing about where it came from.
+if [[ "${POKER_SQL_CONNECTION_STRING}" == *[$'\x01'-$'\x1f']* ]]; then
+    echo "POKER_SQL_CONNECTION_STRING contains a control character (newline or tab?). Remove it and rerun." >&2
+    exit 1
+fi
+
 settings_file="$(mktemp "${TMPDIR:-/tmp}/poker-appsettings.XXXXXX")"
 trap 'rm -f "${settings_file}"' EXIT
 chmod 600 "${settings_file}"
