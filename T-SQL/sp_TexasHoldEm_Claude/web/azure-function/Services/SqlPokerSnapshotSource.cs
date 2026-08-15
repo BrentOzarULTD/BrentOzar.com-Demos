@@ -35,9 +35,23 @@ public sealed class SqlPokerSnapshotSource : IPokerSnapshotSource
         // The viewer renders neither WhatNow nor History, so the default asks the procedure for
         // the least it will give us. ThisGame pulls every log row since the game started, which
         // on a long table is hundreds of strings that every polling browser downloads every ten
-        // seconds and throws away. Set PokerShowWhatHappened=ThisGame to put the play-by-play
-        // back in the payload for a viewer that wants to render it.
-        ShowWhatHappened = configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? "ThisTurn";
+        // seconds and throws away. Set PokerShowWhatHappened=ThisGame (this game) or AllHistory
+        // (everything retained) to put the play-by-play back for a viewer that renders it.
+        //
+        // Normalized to match what the procedure itself does with this parameter:
+        //
+        //     SET @ShowWhatHappened = ISNULL(NULLIF(LTRIM(RTRIM(@ShowWhatHappened)), N''), N'ThisTurn');
+        //
+        // so surrounding whitespace is stripped and a blank value falls back to ThisTurn. The
+        // Function has no business refusing to start on input the database would have accepted.
+        // Trimming here is slightly broader than T-SQL's LTRIM/RTRIM - it takes tabs and newlines
+        // too - which is safe because SQL only ever sees the normalized option, never the raw
+        // setting.
+        var configuredShowWhatHappened =
+            (configuration.GetValue("PokerShowWhatHappened", "ThisTurn") ?? string.Empty).Trim();
+        ShowWhatHappened = configuredShowWhatHappened.Length == 0
+            ? "ThisTurn"
+            : configuredShowWhatHappened;
         if (!ShowWhatHappenedOptions.Contains(ShowWhatHappened, StringComparer.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
