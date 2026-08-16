@@ -916,21 +916,24 @@ BEGIN
            AND ISNULL((SELECT MAX(EventTime) FROM TexasHoldEm_Public.TexasHoldEm_Log), SYSDATETIME())
                < DATEADD(minute, -@AbandonedAfterMinutes, SYSDATETIME())
         BEGIN
-            /* The table is abandoned, not the bankroll. Bank each seated
-               human's remaining stack under the same 10-minute SPECTATOR
-               retention window used by a shot-clock removal, without labeling
-               the abandonment as a player timeout. Starting the clock now
-               matters: their prior LastSeenAt is necessarily older than the
-               abandonment threshold and would expire on this same call. */
+            /* The table is abandoned, not the identity. Bank each seated
+               human under the normal retention rules: a positive stack becomes
+               a SPECTATOR bankroll, while zero chips becomes an OUT lockout.
+               This is not a player timeout. Starting the clock now matters:
+               their prior LastSeenAt is necessarily older than the abandonment
+               threshold and would otherwise expire on this same call. */
             UPDATE i
-               SET Chips = p.Chips, PlayerRole = 'SPECTATOR', WantsSeat = 0,
+               SET Chips = p.Chips,
+                   PlayerRole = CASE WHEN p.Chips <= 0 THEN 'OUT'
+                                     ELSE 'SPECTATOR' END,
+                   WantsSeat = 0,
                    TimedOut = 0, LastSeenAt = SYSDATETIME(),
                    LastPlayedHand = p.LastPlayedHand,
                    LastViewedHand = p.LastViewedHand
             FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
             JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
               ON p.PlayerName = i.PlayerName
-            WHERE p.IsBot = 0 AND p.Chips > 0;
+            WHERE p.IsBot = 0;
 
             DELETE TexasHoldEm_Public.TexasHoldEm_Players;
             DELETE TexasHoldEm_Public.TexasHoldEm_HandBusts;
