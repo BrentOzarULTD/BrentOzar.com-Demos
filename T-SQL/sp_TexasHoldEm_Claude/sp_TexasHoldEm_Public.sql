@@ -534,6 +534,7 @@ DECLARE @rc int,
         @SeatStolen bit = 0,
         @GaveUp bit = 0,
         @GameGone bit = 0,
+        @MissedResultDeadline bit = 0,
         @TargetHand int = 0,
         @WaitStart datetime2 = SYSDATETIME(),
         @LastLogId int = 0,
@@ -1239,9 +1240,63 @@ BEGIN
                 SET @LeftTable = 1;
                 SET @ReturnNow = 1;
             END
+            ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @Action IS NULL
+                    AND @MyReservedSeat IS NOT NULL
+                    AND NOT EXISTS
+                        (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players
+                         WHERE SeatNum = @MyReservedSeat)
+            BEGIN
+                /* Hand cleanup may already have removed the bot that promised
+                   this chair. Promote the returning waiter now instead of
+                   reporting that the (already-finished) hand is still in
+                   progress and making them wait for the next-hand engine. */
+                SET @MySeat = @MyReservedSeat;
+
+                INSERT TexasHoldEm_Public.TexasHoldEm_Players
+                    (SeatNum, PlayerName, SessionId, SessionLoginTime,
+                     PasswordSalt, PasswordHash, IsBot, Chips)
+                SELECT @MySeat, w.PlayerName, w.SessionId, w.SessionLoginTime,
+                       w.PasswordSalt, w.PasswordHash, 0,
+                       ISNULL(i.Chips, @StartingChips)
+                FROM TexasHoldEm_Public.TexasHoldEm_Waitlist AS w
+                LEFT JOIN TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                  ON i.PlayerName = w.PlayerName
+                WHERE w.WaitId = @WaitId;
+
+                UPDATE i
+                   SET PlayerRole = 'PLAYER', WantsSeat = 0, TimedOut = 0,
+                       SessionId = p.SessionId, SessionLoginTime = p.SessionLoginTime,
+                       Chips = p.Chips, LastSeenAt = SYSDATETIME()
+                FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+                  ON p.PlayerName = i.PlayerName
+                WHERE p.SeatNum = @MySeat;
+
+                DELETE TexasHoldEm_Public.TexasHoldEm_Waitlist WHERE WaitId = @WaitId;
+
+                INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
+                SELECT g.HandNumber, CONCAT(@PlayerName,
+                       N' takes the reserved seat with ', p.Chips,
+                       N' chips and will be dealt into the next hand.')
+                FROM TexasHoldEm_Public.TexasHoldEm_Game AS g
+                JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+                  ON p.SeatNum = @MySeat;
+
+                SET @IdentityRole = 'PLAYER';
+                SET @IdentityTimedOut = 0;
+                SELECT @IdentityChips = Chips, @JoinChips = Chips
+                FROM TexasHoldEm_Public.TexasHoldEm_Players
+                WHERE SeatNum = @MySeat;
+                SET @WaitId = NULL;
+                SET @MyReservedSeat = NULL;
+            END
             ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0 AND @MyReservedSeat IS NOT NULL
             BEGIN
-                SET @Notice = N'Your seat is reserved - a robot is giving it up at the end of the current hand. Run EXEC sp_TexasHoldEm_Public again in a bit to sit down.';
+                SET @Notice = CASE WHEN EXISTS
+                    (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players
+                     WHERE SeatNum = @MyReservedSeat)
+                    THEN N'Your seat is reserved - a robot is giving it up at the end of the current hand. Run EXEC sp_TexasHoldEm_Public again in a bit to sit down.'
+                    ELSE N'Your reserved seat is ready. Run EXEC sp_TexasHoldEm_Public without an @Action to sit down.' END;
                 SET @ReturnNow = 1;
             END
             ELSE IF @WaitId IS NOT NULL AND @ReturnNow = 0
@@ -1812,6 +1867,62 @@ BEGIN
                A busted player who never comes back to look is covered by the
                same deadline as a disconnected one. */
             IF @UnviewedHumans > 0 AND SYSDATETIME() < @NextHandAt BREAK;
+
+            /* The acknowledgement deadline is also the sit-out boundary.
+               A seated human who never collected the prior hand's result is
+               no longer present enough to receive cards. Bank their stack and
+               move them off-table before promotions and the next deal; their
+               retained identity can explicitly request another seat later. */
+            IF EXISTS
+                (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players
+                 WHERE IsBot = 0
+                   AND LastPlayedHand = @GHand
+                   AND LastViewedHand < @GHand)
+            BEGIN
+                SET @MissedResultDeadline = 0;
+                IF @MySeat IS NOT NULL AND EXISTS
+                    (SELECT 1 FROM TexasHoldEm_Public.TexasHoldEm_Players
+                     WHERE SeatNum = @MySeat
+                       AND IsBot = 0
+                       AND LastPlayedHand = @GHand
+                       AND LastViewedHand < @GHand)
+                    SET @MissedResultDeadline = 1;
+
+                UPDATE i
+                   SET Chips = p.Chips, PlayerRole = 'SPECTATOR', WantsSeat = 0,
+                       TimedOut = 1, LastSeenAt = SYSDATETIME(),
+                       LastPlayedHand = p.LastPlayedHand,
+                       LastViewedHand = p.LastViewedHand
+                FROM TexasHoldEm_Public.TexasHoldEm_Identities AS i
+                JOIN TexasHoldEm_Public.TexasHoldEm_Players AS p
+                  ON p.PlayerName = i.PlayerName
+                WHERE p.IsBot = 0
+                  AND p.LastPlayedHand = @GHand
+                  AND p.LastViewedHand < @GHand;
+
+                INSERT TexasHoldEm_Public.TexasHoldEm_Log (HandNumber, Message)
+                SELECT @GHand, CONCAT(p.PlayerName,
+                       N' did not check in after the hand and leaves the seat with ',
+                       p.Chips, N' retained chips.')
+                FROM TexasHoldEm_Public.TexasHoldEm_Players AS p
+                WHERE p.IsBot = 0
+                  AND p.LastPlayedHand = @GHand
+                  AND p.LastViewedHand < @GHand;
+
+                DELETE TexasHoldEm_Public.TexasHoldEm_Players
+                WHERE IsBot = 0
+                  AND LastPlayedHand = @GHand
+                  AND LastViewedHand < @GHand;
+
+                IF @MissedResultDeadline = 1
+                BEGIN
+                    SET @IdentityRole = 'SPECTATOR';
+                    SET @IdentityTimedOut = 1;
+                    SELECT @IdentityChips = Chips, @JoinChips = Chips
+                    FROM TexasHoldEm_Public.TexasHoldEm_Identities
+                    WHERE IdentityId = @IdentityId;
+                END
+            END
             SET @StartHandNow = 1;
         END
 

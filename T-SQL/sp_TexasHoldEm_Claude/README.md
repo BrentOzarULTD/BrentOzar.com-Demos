@@ -101,7 +101,9 @@ credentials.
   `OUT` rows first, then stale spectators, and never an active seat.
 - After a hand, the final table and transcript remain available until every
   participating human checks in or a 60-second acknowledgement deadline
-  expires. Disconnected, departed, and busted identities cannot hold the
+  expires. A seated player who misses that deadline is moved to `SPECTATOR`
+  with their remaining stack retained and must explicitly request a seat when
+  they return. Disconnected, departed, and busted identities cannot hold the
   next hand indefinitely.
 - No side pots: you can call all-in for less, and a short-stacked winner
   takes the whole pot. This is a demo, not the WSOP.
